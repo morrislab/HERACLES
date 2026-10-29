@@ -1,0 +1,14 @@
+# environments and build artifacts
+.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.so
+
+# RapidNJ binary built at install / first use
+heracles/_bin/
+
+# local agent / editor files
+CLAUDE.md
+.DS_Store

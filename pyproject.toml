@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heracles"
+dynamic = ["version"]
+description = "Hyperbolic point-configuration embedding for CRISPR lineage-tracing tree reconstruction"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "GPL-2.0-or-later"}
+authors = [{name = "Sitara Persad", email = "sitara94@gmail.com"}]
+keywords = ["phylogenetics", "lineage tracing", "CRISPR", "hyperbolic embedding", "single-cell"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "torch>=2.0",
+    "geoopt>=0.5",
+]
+
+[project.optional-dependencies]
+figures = ["matplotlib"]
+notebook = ["jupyterlab", "ipykernel", "nbclient", "nbformat", "matplotlib"]
+dev = ["pytest", "matplotlib"]
+
+[project.urls]
+Repository = "https://github.com/morrislab/HERACLES"
+
+[project.scripts]
+heracles = "heracles.__main__:main"
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: long-running tests (CLI end-to-end, RapidNJ build); run with -m slow",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "heracles.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["heracles*"]
+exclude = ["heracles._vendor*"]   # data (C++ source), not a Python package
+
+[tool.setuptools.package-data]
+heracles = ["_bin/rapidnj*", "_vendor/rapidnj/LICENSE", "_vendor/rapidnj/*.md",
+            "_vendor/rapidnj/Makefile", "_vendor/rapidnj/src/**/*.cpp",
+            "_vendor/rapidnj/src/**/*.h", "_vendor/rapidnj/src/**/*.hpp"]
+
+[tool.setuptools.exclude-package-data]
+heracles = ["_vendor/rapidnj/src/distanceCalculation/gpu/*"]

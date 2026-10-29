@@ -1,0 +1,15 @@
+# Dependencies for HERACLES and its tutorial notebooks.
+#   pip install -r requirements.txt
+#   pip install .
+# For a GPU, install the PyTorch build for your CUDA version first (https://pytorch.org).
+
+numpy>=2.0
+scipy>=1.10
+pandas>=2.0
+torch>=2.0
+geoopt>=0.5
+
+# tutorials and plots
+matplotlib
+jupyterlab
+ipykernel

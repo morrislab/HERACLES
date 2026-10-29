@@ -1,0 +1,3 @@
+include LICENSE README.md
+recursive-include heracles/_vendor/rapidnj *.cpp *.h *.hpp Makefile LICENSE *.md
+prune heracles/_vendor/rapidnj/src/distanceCalculation/gpu
