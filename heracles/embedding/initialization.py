@@ -10,7 +10,7 @@ no ``n x n`` matrix is built.  A starting tree given as
 
 import logging
 import os
-import time as _time
+import time
 
 import numpy as np
 import torch
@@ -20,27 +20,28 @@ from heracles.constants import HAMMING_ROW_CHUNK
 from heracles.trees.rapidnj import rapidnj_available, rapidnj_executable
 from heracles.trees.tree import Taxon
 from heracles.trees.utils import (
-    FOUNDER_LABEL, as_newick, nj_tree, parse_newick, prune_founder_newick, tree_distances,
+    FOUNDER_LABEL, as_newick, linkage_to_tree, nj_tree, nj_tree_from_rows, parse_newick,
+    prune_founder_newick, tree_distances,
 )
 
 logger = logging.getLogger("heracles")
 
 
 __all__ = [
-    'classical_mds',
-    'landmark_mds_from_rows',
-    'default_n_landmarks',
-    'choose_landmarks',
-    'lorentz_manifold',
-    'seed_distances',
-    'iter_weighted_hamming_rows',
-    'condensed_weighted_hamming',
-    'tree_init_dists',
-    'TREE_INIT_METHODS',
-    'INIT_METHODS',
-    'init_points',
-    'is_newick_string',
-    'load_init_tree_dists',
+    "classical_mds",
+    "landmark_mds_from_rows",
+    "default_n_landmarks",
+    "choose_landmarks",
+    "lorentz_manifold",
+    "seed_distances",
+    "iter_weighted_hamming_rows",
+    "condensed_weighted_hamming",
+    "tree_init_dists",
+    "TREE_INIT_METHODS",
+    "INIT_METHODS",
+    "init_points",
+    "is_newick_string",
+    "load_init_tree_dists",
 ]
 
 
@@ -149,8 +150,8 @@ def landmark_mds_from_rows(D_lx, landmarks, dim, eig_tol=_LANDMARK_EIG_TOL):
 
 
 def lorentz_manifold(dimension):
-    """Returns ``(manifold, dimension + 1)``: the Lorentz model of curvature -1."""
-    return geoopt.Lorentz(k=1.0), dimension + 1
+    """The Lorentz model of curvature -1 for a *dimension*-dimensional embedding (points have ``dimension + 1`` coordinates)."""
+    return geoopt.Lorentz(k=1.0)
 
 
 def seed_distances(states, rows=None, *, missing_state=-1, dtype=np.float64):
@@ -255,12 +256,11 @@ def tree_init_dists(states, labels, *, method, rows=None, seed_dists=None, missi
     Returns:
         ``(dists, tree_newick, timings)``, *dists* ``(n, n)`` or ``(len(rows), n)``.
     """
-    from heracles.trees.utils import linkage_to_newick, nj_tree_from_rows
     if method not in TREE_INIT_METHODS:
         raise ValueError("method must be one of %s, got %r" % (TREE_INIT_METHODS, method))
     labels = list(labels)
     n = len(labels)
-    t0 = _time.perf_counter()
+    t0 = time.perf_counter()
     if method == "rapidnj":
         blocks = (((0, n, seed_dists),) if seed_dists is not None
                   else iter_weighted_hamming_rows(states, missing_state))
@@ -274,19 +274,17 @@ def tree_init_dists(states, labels, *, method, rows=None, seed_dists=None, missi
         cond = (squareform(np.asarray(seed_dists, dtype=np.float64), checks=False)
                 if seed_dists is not None else condensed_weighted_hamming(states, missing_state))
         Z = linkage(cond, method="average")
-        del cond
-        tree = parse_newick(linkage_to_newick(to_tree(Z), labels) + ";", rooting="force-rooted")
-        del Z
+        tree = linkage_to_tree(to_tree(Z), labels)
     for edge in tree.preorder_edge_iter():
         if edge.length is not None and edge.length < 0:
             edge.length = 0.0
-    tree_creation_s = _time.perf_counter() - t0
+    tree_creation_s = time.perf_counter() - t0
     tree_nwk = as_newick(tree, rooted=False)
-    t1 = _time.perf_counter()
+    t1 = time.perf_counter()
     dists = tree_distances(tree, labels, weighted=True,
                            rows=None if rows is None else np.asarray(rows))
     return dists, tree_nwk, {"tree_creation_s": tree_creation_s,
-                             "distance_extraction_s": _time.perf_counter() - t1}
+                             "distance_extraction_s": time.perf_counter() - t1}
 
 
 INIT_METHODS = ("rapidnj_clamped", "upgma", "mds")
@@ -318,7 +316,7 @@ def init_points(manifold, dimension, *, states=None, seed_dists=None, labels=Non
         manifold, and a dict with the timings, ``init_tree_newick`` (or None),
         ``init_method_used``, ``init_dimension`` and ``n_landmarks``.
     """
-    t_total_start = _time.perf_counter()
+    t_total_start = time.perf_counter()
     if init_method not in INIT_METHODS:
         raise ValueError("unknown init_method %r (%s)" % (init_method, "|".join(INIT_METHODS)))
     source = init_dists if init_dists is not None else seed_dists
@@ -357,7 +355,7 @@ def init_points(manifold, dimension, *, states=None, seed_dists=None, labels=Non
              else seed_distances(states, landmarks, missing_state=missing_state))
         method_used = "landmark_mds"
 
-    t_emb = _time.perf_counter()
+    t_emb = time.perf_counter()
     if landmarks is None:
         coords = classical_mds(np.asarray(D, dtype=np.float64), dimension)
     else:
@@ -371,7 +369,7 @@ def init_points(manifold, dimension, *, states=None, seed_dists=None, labels=Non
     tangent = torch.tensor(coords, dtype=torch.float64)
     zeros = torch.zeros(tangent.shape[0], 1, dtype=torch.float64)
     result = manifold.expmap0(torch.cat([zeros, tangent], dim=1))
-    embedding_s = _time.perf_counter() - t_emb
+    embedding_s = time.perf_counter() - t_emb
 
     if tree_nwk is not None and FOUNDER_LABEL in labels:
         tree_nwk = prune_founder_newick(tree_nwk, FOUNDER_LABEL)
@@ -379,7 +377,7 @@ def init_points(manifold, dimension, *, states=None, seed_dists=None, labels=Non
         "tree_creation_s": tree_timings.get("tree_creation_s", 0.0),
         "distance_extraction_s": tree_timings.get("distance_extraction_s", 0.0),
         "embedding_s": embedding_s,
-        "total_s": _time.perf_counter() - t_total_start,
+        "total_s": time.perf_counter() - t_total_start,
         "init_tree_newick": tree_nwk,
         "init_method_used": method_used,
         "init_dimension": int(coords.shape[1]),

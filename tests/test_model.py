@@ -234,8 +234,8 @@ def test_save_load_roundtrip(fitted_model):
     assert loaded.stochastic_delta_ == m.stochastic_delta_
     assert set(loaded.trees_.keys()) == set(m.trees_.keys())
     for r in m.readouts:
-        orig_nwk = m.trees_[r].as_string(schema="newick").strip()
-        load_nwk = loaded.trees_[r].as_string(schema="newick").strip()
+        orig_nwk = m.trees_[r].as_string().strip()
+        load_nwk = loaded.trees_[r].as_string().strip()
         assert orig_nwk == load_nwk
 
     assert loaded.diagnostics_["init_time"] == m.diagnostics_["init_time"]
@@ -529,10 +529,8 @@ def test_default_dimension_is_five_root_n(tmp_path):
     from heracles.fit import embedding_dimension
 
     assert embedding_dimension(5000) == 354 and embedding_dimension(0) == 2
-    with pytest.raises(ValueError, match="not supported"):
+    with pytest.raises(ValueError, match="dimension"):
         HeraclesConfig(dimension="auto")
-    cfg, ignored = HeraclesConfig.from_params({"dimension": "auto"})   # saved config: ignored with a note
-    assert cfg.dimension is None and any("auto" in x for x in ignored)
 
     rng = np.random.default_rng(1)
     n = 100                       # 5*sqrt(100) = 50 axes fits inside 101 points
@@ -573,23 +571,6 @@ def test_init_tree_path_and_string(fitted_model, small_cm, tmp_path):
     partial = "(%s);" % ",".join(str(x) for x in small_cm.index[:4])
     with pytest.raises(ValueError, match="init_tree lacks"):
         Heracles(outdir=tmp_path / "c", init_tree=partial, **kw).fit(small_cm)
-
-
-def test_load_maps_flat_fitted_keys_into_diagnostics(fitted_model, tmp_path):
-    """load() reads optimiser internals stored as flat fitted keys into diagnostics_."""
-    path = tmp_path / "m.npz"
-    fitted_model.save(path)
-    data = dict(np.load(path, allow_pickle=False))
-    meta = json.loads(str(data["_metadata_json"]))
-    diag = meta.pop("diagnostics")
-    meta["telemetry"] = diag.pop("telemetry")
-    meta["fitted"].update({k + "_": v for k, v in diag.items()})
-    data["_metadata_json"] = np.array(json.dumps(meta))
-    old = tmp_path / "old.npz"
-    np.savez(old, **data)
-    loaded = Heracles.load(old)
-    assert loaded.diagnostics_["init_time"] == fitted_model.diagnostics_["init_time"]
-    assert loaded.diagnostics_["telemetry"] == fitted_model.diagnostics_["telemetry"]
 
 
 # Input checks and error messages
@@ -658,6 +639,27 @@ def test_nj_falls_back_with_a_warning(small_cm, tmp_path, monkeypatch):
     assert robinson_foulds(fast.trees_["nj"], slow.trees_["nj"]) == 0
 
 
-def test_rapidnj_readout_name_points_to_nj(tmp_path):
-    with pytest.raises(ValueError, match="'rapidnj' is now 'nj'"):
+def test_unknown_readout_name_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="unknown readout"):
         Heracles(outdir=tmp_path, readouts=["nj", "rapidnj"])
+
+
+def test_learned_allele_prior_keeps_the_training_mask(tmp_path):
+    """The saved prior is the one the fit used: slot 0 exactly 1, no mass on alleles
+    absent from a site, and the allowed alleles summing to 1."""
+    from heracles.embedding.priors import build_allele_priors
+    rng = np.random.default_rng(0)
+    cm = pd.DataFrame(rng.integers(0, 6, (60, 8)), index=["c%d" % i for i in range(60)])
+    cm.iloc[:, 0] = np.where(cm.iloc[:, 0] > 0, 1, 0)       # site 0 carries one allele only
+    m = Heracles(outdir=tmp_path / "p", max_iterations=20, convergence_thresh=None,
+                 learn_allele_prior=True, init_method="mds", dimension=4)
+    m.fit(cm)
+    init = build_allele_priors(cm.to_numpy(), prior="per_site_uniform")
+    saved = m.learned_allele_prior_
+    assert saved.shape == init.shape
+    np.testing.assert_array_equal(saved[:, 0], 1.0)
+    np.testing.assert_array_equal(saved[init == 0], 0.0)
+    np.testing.assert_allclose(saved[:, 1:].sum(axis=1), 1.0, atol=1e-12)
+    assert saved[0, 1] == 1.0
+    loaded = Heracles.load(tmp_path / "p" / "model.npz")
+    np.testing.assert_array_equal(loaded.learned_allele_prior_, saved)

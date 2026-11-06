@@ -50,7 +50,7 @@ def test_build_rapidnj_produces_a_working_binary(tmp_path):
 
     if find_compiler() is None:
         pytest.skip("no C++ compiler")
-    exe = build_rapidnj(tmp_path / "rapidnj", quiet=True)
+    exe = build_rapidnj(tmp_path / "rapidnj")
     phy = tmp_path / "t.phy"
     phy.write_text("4\nA 0 2 4 6\nB 2 0 4 6\nC 4 4 0 6\nD 6 6 6 0\n")
     out = subprocess.run([str(exe), str(phy), "-i", "pd", "-o", "t"],

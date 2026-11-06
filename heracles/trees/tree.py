@@ -2,8 +2,7 @@
 
 Provides ``Tree``, ``Node``, ``Taxon``, ``TaxonNamespace``, an iterative
 Newick parser/writer, a pure-Python neighbour joining and the bipartition
-primitives behind the Robinson-Foulds distance. Method names follow dendropy,
-so code written for dendropy trees mostly works unchanged.
+primitives behind the Robinson-Foulds distance.
 
 Reading, writing, rooting and comparing trees is in :mod:`heracles.trees.utils`;
 start there unless you are working on the data structure itself.
@@ -15,13 +14,13 @@ import numpy as np
 
 
 __all__ = [
-    'quote_label',
-    'Taxon',
-    'TaxonNamespace',
-    'Node',
-    'Tree',
-    'native_nj',
-    'symmetric_difference',
+    "quote_label",
+    "Taxon",
+    "TaxonNamespace",
+    "Node",
+    "Tree",
+    "native_nj",
+    "symmetric_difference",
 ]
 
 
@@ -150,17 +149,14 @@ class Tree:
     # Newick input and output
 
     @classmethod
-    def get(cls, *, data=None, schema="newick", **kwargs):
-        """Parse a Newick string (*data*); accepts ``taxon_namespace`` and ``rooting``."""
-        if schema != "newick":
-            raise ValueError(f"unsupported schema: {schema!r}")
-        return _parse_newick(data, **kwargs)
+    def get(cls, *, data, taxon_namespace=None, rooting=None):
+        """Parse a Newick string (*data*); see :func:`_parse_newick` for the options."""
+        return _parse_newick(data, taxon_namespace=taxon_namespace, rooting=rooting)
 
-    def as_string(self, *, schema="newick", **kwargs) -> str:
+    def as_string(self, *, suppress_rooting=False, suppress_internal_node_labels=False) -> str:
         """Newick string of the tree, ending in ``;`` and a newline."""
-        if schema != "newick":
-            raise ValueError(f"unsupported schema: {schema!r}")
-        return _write_newick(self, **kwargs)
+        return _write_newick(self, suppress_rooting=suppress_rooting,
+                             suppress_internal_node_labels=suppress_internal_node_labels)
 
     # iterators
 
@@ -205,13 +201,11 @@ class Tree:
             if not node.is_leaf():
                 yield node
 
-    def internal_edges(self, exclude_seed_edge=False) -> list[_Edge]:
+    def internal_edges(self) -> list[_Edge]:
         """Edges above internal non-root nodes."""
         out: list[_Edge] = []
         for node in self.preorder_node_iter():
             if node.is_leaf():
-                continue
-            if node is self.seed_node and exclude_seed_edge:
                 continue
             if node.parent_node is not None:
                 out.append(node.edge)
@@ -223,6 +217,13 @@ class Tree:
             if node.taxon is not None and node.taxon.label == label:
                 return node
         return None
+
+    def use_taxon_namespace(self, taxon_namespace):
+        """Re-point every leaf at the taxon of the same label in *taxon_namespace*, in place."""
+        for leaf in self.leaf_node_iter():
+            if leaf.taxon is not None:
+                leaf.taxon = taxon_namespace.require_taxon(str(leaf.taxon.label))
+        self.taxon_namespace = taxon_namespace
 
     def taxon_namespace_scoped_copy(self) -> Tree:
         """Deep copy of the nodes that shares this tree's taxon namespace."""
@@ -243,7 +244,7 @@ class Tree:
 
     # topology operations
 
-    def to_outgroup_position(self, outgroup_node: Node, **_kwargs):
+    def to_outgroup_position(self, outgroup_node: Node):
         """Reroot the tree so *outgroup_node* is a direct child of the root."""
         if outgroup_node is self.seed_node:
             return
@@ -337,17 +338,17 @@ class Tree:
             dists.append(rd[id(node)])
         return dists
 
-    def update_bipartitions(self, **_kwargs):
-        """Does nothing; accepted so code written for dendropy trees runs unchanged."""
-        pass
-
 
 # Newick parser (iterative, no recursion limit)
 
-def _parse_newick(data: str, **kwargs) -> Tree:
-    """Iterative Newick parser behind :meth:`Tree.get`."""
-    taxon_namespace: TaxonNamespace | None = kwargs.get("taxon_namespace")
-    rooting = kwargs.get("rooting")
+def _parse_newick(data: str, *, taxon_namespace: TaxonNamespace | None = None,
+                  rooting=None) -> Tree:
+    """Iterative Newick parser behind :meth:`Tree.get`.
+
+    *taxon_namespace* supplies the taxa (new labels are added to it);
+    *rooting* ``"force-rooted"`` / ``"force-unrooted"`` overrides the ``[&R]`` /
+    ``[&U]`` tag.
+    """
 
     data = data.strip()
 
@@ -509,10 +510,7 @@ def quote_label(label: str) -> str:
 
 
 def _write_newick(tree: Tree, *, suppress_rooting=False,
-                  suppress_internal_node_labels=False,
-                  suppress_leaf_taxon_labels=False,
-                  suppress_internal_taxon_labels=False,
-                  **_kw) -> str:
+                  suppress_internal_node_labels=False) -> str:
     """Iterative Newick writer behind :meth:`Tree.as_string`."""
     buf: list[str] = []
     if not suppress_rooting and tree.is_rooted:
@@ -526,7 +524,7 @@ def _write_newick(tree: Tree, *, suppress_rooting=False,
             continue
         node: Node = item
         if node.is_leaf():
-            if not suppress_leaf_taxon_labels and node.taxon is not None:
+            if node.taxon is not None:
                 buf.append(quote_label(node.taxon.label))
             if node.edge.length is not None:
                 buf.append(":")

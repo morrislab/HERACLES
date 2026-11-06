@@ -19,7 +19,7 @@ from heracles.models.base import (EditModel, EditProcess, model_option, register
 from heracles.models.missing import CassetteCorrection, CassetteDropout, SiteDropout
 from heracles.embedding.objective import quartet_loss_fn
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("heracles")
 
 
 __all__ = ["Cas9Process", "Cas9Model"]

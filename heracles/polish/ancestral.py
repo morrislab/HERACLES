@@ -15,23 +15,24 @@ import dataclasses
 import json
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 
 
 __all__ = [
-    'PAD_STATE',
-    'DEL_STATE',
-    'OTHER_STATE',
-    'SCALE_FLOOR',
-    'AncestralResult',
-    'prepare_model',
-    'TreeLikelihood',
-    'index_tree',
-    'pruning_passes',
-    'infer_ancestral_states',
-    'optimize_branch_lengths',
-    'call_states',
-    'save_posteriors_npz',
-    'load_posteriors_npz',
+    "PAD_STATE",
+    "DEL_STATE",
+    "OTHER_STATE",
+    "SCALE_FLOOR",
+    "AncestralResult",
+    "prepare_model",
+    "TreeLikelihood",
+    "index_tree",
+    "pruning_passes",
+    "infer_ancestral_states",
+    "optimize_branch_lengths",
+    "call_states",
+    "save_posteriors_npz",
+    "load_posteriors_npz",
 ]
 
 
@@ -191,11 +192,6 @@ class TreeLikelihood:
             self.n_data_sites = int(self.prior_mass.shape[0])
         if self.mu_site is None:
             self.mu_site = self.mutation_rate
-
-    @property
-    def stacked(self):
-        """True when cassette pattern sites are stacked after the data sites."""
-        return self.site_weight is not None
 
     def total(self, per_site):
         """Whole-tree log-likelihood from a per-(stacked-)site vector."""
@@ -479,7 +475,7 @@ def infer_ancestral_states(tree, cm, *, mutation_rate=None, allele_prior=None,
         state_values=model.state_values[:S], n_states=model.n_states[:S],
         loglik_per_site=model.fold(pr.loglik_per_site),
         loglik=model.total(pr.loglik_per_site), site_names=model.site_names,
-        tree_newick=tree.as_string(schema="newick").strip(),
+        tree_newick=tree.as_string().strip(),
         mutation_rate=float(model.mutation_rate), heritable_eps=float(model.heritable_eps),
         stochastic_delta=float(np.mean(model.stochastic_delta)),
         root_edge_length=float(root_edge_length))
@@ -525,7 +521,7 @@ def _root_loglik(t, F_root, model):
 def optimize_branch_lengths(tree, cm, *, mutation_rate=None, allele_prior=None,
                             heritable_eps=0.0, stochastic_delta=0.0,
                             root_edge_length=0.0, missing_state=-1,
-                            edges=None, n_sweeps=2, tol=1e-4, t_max=None,
+                            n_sweeps=2, tol=1e-4, t_max=None,
                             optimize_root_edge=True, site_groups=None, likelihood=None):
     """Maximum-likelihood branch lengths on a fixed topology, in place.
 
@@ -538,8 +534,6 @@ def optimize_branch_lengths(tree, cm, *, mutation_rate=None, allele_prior=None,
         cm, mutation_rate, allele_prior, heritable_eps, stochastic_delta,
             missing_state, site_groups, likelihood: as in :func:`infer_ancestral_states`.
         root_edge_length (float): starting founder-to-seed length.
-        edges (iterable of Node, optional): optimise only the edges above these
-            nodes (default: every non-root node).
         n_sweeps (int): maximum number of sweeps.
         tol (float): absolute tolerance on each length.
         t_max (float, optional): upper bound per edge (default: 4x the tree
@@ -549,8 +543,6 @@ def optimize_branch_lengths(tree, cm, *, mutation_rate=None, allele_prior=None,
     Returns:
         tuple: ``(loglik, root_edge_length, n_sweeps_done)``.
     """
-    from scipy.optimize import minimize_scalar
-
     model = _likelihood_or_build(likelihood, cm, mutation_rate=mutation_rate,
                                  allele_prior=allele_prior, heritable_eps=heritable_eps,
                                  stochastic_delta=stochastic_delta,
@@ -563,8 +555,7 @@ def optimize_branch_lengths(tree, cm, *, mutation_rate=None, allele_prior=None,
     if t_max is None:
         t_max = max(1.0, 4.0 * max(tree.calc_node_root_distances(
             return_leaf_distances_only=True) or [0.0]))
-    targets = [n for n in (nodes if edges is None else edges)
-               if n is not tree.seed_node]
+    targets = [n for n in nodes if n is not tree.seed_node]
     root_edge_length = max(0.0, float(root_edge_length))
 
     def best_t(fn, t0):

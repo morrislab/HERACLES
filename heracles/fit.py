@@ -12,8 +12,10 @@ import json
 import logging
 import math
 import os
-import time as _time
+import platform
+import time
 import warnings
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -21,38 +23,35 @@ import torch
 import geoopt
 
 from heracles.config import HeraclesConfig
-from heracles.constants import (CONVERGENCE_CHECK_EVERY, CONVERGENCE_PATIENCE, DIM_PER_SQRT_N,
+from heracles.constants import (DIM_PER_SQRT_N,
                                 PHYLIP_BYTES_PER_ENTRY)
-from heracles.models import get_model, model_from_legacy_params, unregistered_parts
+from heracles.models import get_model, unregistered_parts
 from heracles.embedding.initialization import (
     choose_landmarks, default_n_landmarks, init_points, is_newick_string, lorentz_manifold,
 )
-from heracles.embedding.optimize import (
-    optimize, pairwise_dists, ULTRAMETRIC_LR_DUAL, ULTRAMETRIC_MAX_WEIGHT, TREELIKE_N_QUARTETS,
-    TREELIKE_LR_DUAL, TREELIKE_MAX_WEIGHT, TREELIKE_MIN_WEIGHT,
-)
-from heracles.embedding.priors import build_allele_priors, missing_log_prior, resolve_prior  # noqa: F401 (re-exported)
-from heracles.embedding.sampler import (banded_sampler_reach, default_batch_size,
+from heracles.embedding.optimize import optimize, pairwise_dists
+from heracles.embedding.priors import build_allele_priors
+from heracles.embedding.sampler import (sampler_reach, default_batch_size,
                                         n_distinct_quartets)
-from heracles.trees.readouts import (  # noqa: F401 (re-exported)
-    READOUTS, heracles_nj, heracles_upgma,
-)
-from heracles.runinfo import git_commit, resolve_device, setup_run_logging, teardown_run_logging
-from heracles.trees.utils import FOUNDER_LABEL, as_newick, write_newick  # noqa: F401 (re-exported)
+from heracles.trees.collapse import sokal_collapse
+from heracles.trees.readouts import READOUTS
+from heracles.runinfo import (git_commit, peak_rss_mb, resolve_device, setup_run_logging,
+                              teardown_run_logging)
+from heracles.trees.utils import FOUNDER_LABEL, as_newick, write_newick
 
 
 __all__ = [
-    'load_character_matrix',
-    'embedding_dimension',
-    'embed',
-    'memory_plan',
-    'Heracles',
+    "load_character_matrix",
+    "embedding_dimension",
+    "embed",
+    "memory_plan",
+    "Heracles",
 ]
 
 
 _NOT_FIT_MSG = "This Heracles instance is not fitted yet. Call .fit() first."
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("heracles")
 
 
 def load_character_matrix(char_matrix, missing_state=-1):
@@ -103,33 +102,13 @@ def _check_readouts(names):
     """Raises ``ValueError`` for names not in :data:`READOUTS`."""
     bad = [r for r in names if r not in READOUTS]
     if bad:
-        hint = ("; 'rapidnj' is now 'nj', which uses RapidNJ whenever it is available"
-                if "rapidnj" in bad else "")
-        raise ValueError(f"unknown readout(s): {bad} (valid: {list(READOUTS)}){hint}")
+        raise ValueError(f"unknown readout(s): {bad} (valid: {list(READOUTS)})")
 
 
 def _loss_fn_meta(loss_fn):
-    """Returns a copy of the loss function's ``meta`` dict for the fit record."""
-    out = {}
-    for k, v in (getattr(loss_fn, "meta", None) or {}).items():
-        if k == "quartet_sampler_stats":
-            v = dict(v) if v else None
-        elif isinstance(v, dict):
-            v = dict(v)
-        out[k] = v
-    return out
-
-
-def _diagnostics_from_flat_keys(meta):
-    """Builds ``diagnostics_`` for a model.npz that stores them as flat ``fitted`` keys."""
-    fitted = meta.get("fitted") or {}
-    diag = {k: fitted.get(k + "_") for k in _DIAGNOSTIC_KEYS if k + "_" in fitted}
-    init_meta = dict(diag.get("init_meta") or {})
-    diag.setdefault("init_tree_newick", init_meta.pop("init_tree_newick", None))
-    diag["init_meta"] = init_meta
-    diag.setdefault("init_method_used", init_meta.get("init_method_used"))
-    diag["telemetry"] = meta.get("telemetry")
-    return diag
+    """A copy of the loss function's ``meta`` dict for the fit record (its dicts copied too)."""
+    return {k: (dict(v) if isinstance(v, dict) else v)
+            for k, v in (getattr(loss_fn, "meta", None) or {}).items()}
 
 
 def embedding_dimension(n_cells):
@@ -215,10 +194,10 @@ def embed(char_matrix, *, config=None, edit_model=None, init_dists=None,
         landmarks = choose_landmarks(m_points, n_lm, seed=cfg.seed)
         est_aug = None                                  # the sampler works from k-NN tables
         if cfg.sampler_knn is None:
-            reach = banded_sampler_reach(cfg.band_kmax, cfg.band_kmax_end,
-                                         cfg.band_local_frac, cfg.band_local_mult_max)
-            cfg = cfg.replace(sampler_knn=min(reach, n_cells - 1))
-        logger.info("low_memory: %d landmarks seed the init, sampler_knn=%d, "
+            reach = sampler_reach(cfg.sampler_strategy, cfg.sampler_max_k, n_cells)
+            if reach is not None:
+                cfg = cfg.replace(sampler_knn=reach)
+        logger.info("low_memory: %d landmarks seed the init, sampler_knn=%s, "
                     "no (%d x %d) matrix is built during the fit",
                     n_lm, cfg.sampler_knn, m_points, m_points)
     else:
@@ -241,50 +220,36 @@ def embed(char_matrix, *, config=None, edit_model=None, init_dists=None,
                                   batch_size=batch_arg, root_weight=root_weight,
                                   learn_allele_prior=cfg.learn_allele_prior,
                                   config=cfg, device=device)
-    has_missing = bool((states_aug < 0).any())
-
-    t_init = _time.perf_counter()
-    manifold, _ = lorentz_manifold(dimension)
+    t_init = time.perf_counter()
+    manifold = lorentz_manifold(dimension)
     points0, init_meta = init_points(
         manifold, dimension, states=states_aug, seed_dists=est_aug, labels=labels_aug,
         init_dists=init_dists, init_method=cfg.init_method, landmarks=landmarks)
-    init_time = _time.perf_counter() - t_init
+    init_time = time.perf_counter() - t_init
     logger.info("init done: method=%s, %.1fs (tree %.1fs, tree distances %.1fs, mds %.1fs)",
                 init_meta["init_method_used"], init_time, init_meta["tree_creation_s"],
                 init_meta["distance_extraction_s"], init_meta["embedding_s"])
 
     leaf_dists, meta = optimize(
-        states_aug, dimension,
-        loss_fn=loss_fn, has_missing=has_missing,
-        init_points=points0, init_meta=init_meta, init_time=init_time,
-        steps=cfg.max_iterations, lr=cfg.lr, seed=cfg.seed,
-        learn_mutation_rate=cfg.learn_mutation_rate,
+        states_aug, dimension, loss_fn=loss_fn, init_points=points0,
+        steps=cfg.max_iterations, lr=cfg.lr, seed=cfg.seed, lr_schedule=cfg.lr_schedule,
+        min_iterations=cfg.min_iterations, convergence_thresh=cfg.convergence_thresh,
         snapshot_epochs=snapshot_epochs,
-        heritable_eps_init=cfg.heritable_eps,
-        stochastic_delta_init=delta_init,
-        learn_heritable_eps=cfg.learn_heritable_eps,
-        learn_stochastic_delta=learn_delta,
+        learn_mutation_rate=cfg.learn_mutation_rate,
+        heritable_eps_init=cfg.heritable_eps, learn_heritable_eps=cfg.learn_heritable_eps,
+        stochastic_delta_init=delta_init, learn_stochastic_delta=learn_delta,
         stochastic_delta_per_site=model.separate_dropout,
         site_groups=model.missing_units(mats.shape[1]),
         heritable_eps_prior_variance=cfg.heritable_eps_prior_variance,
         stochastic_delta_prior_variance=cfg.stochastic_delta_prior_variance,
-        convergence_thresh=cfg.convergence_thresh,
-        patience=CONVERGENCE_PATIENCE, check_every=CONVERGENCE_CHECK_EVERY,
-        lr_schedule=cfg.lr_schedule,
+        treelike_penalty=cfg.treelike_penalty,
+        treelike_penalty_target_delta=cfg.treelike_penalty_target_delta,
         ultrametric_penalty=cfg.ultrametric_penalty,
         ultrametric_target_cv=cfg.ultrametric_target_cv,
-        ultrametric_lr_dual=ULTRAMETRIC_LR_DUAL,
-        ultrametric_max_weight=ULTRAMETRIC_MAX_WEIGHT,
-        treelike_penalty_n_quartets=TREELIKE_N_QUARTETS,
-        treelike_penalty_target_delta=cfg.treelike_penalty_target_delta,
-        treelike_penalty_lr_dual=TREELIKE_LR_DUAL,
-        treelike_penalty_max_weight=TREELIKE_MAX_WEIGHT if cfg.treelike_penalty else 0.0,
-        treelike_penalty_min_weight=TREELIKE_MIN_WEIGHT if cfg.treelike_penalty else 0.0,
-        min_iterations=cfg.min_iterations,
-        device=device,
-        dist_dtype=dist_dtype,
-        materialize_dists=not low_memory,
-        grad_accum=grad_accum)
+        grad_accum=grad_accum, device=device, dist_dtype=dist_dtype,
+        materialize_dists=not low_memory)
+    meta.update(init_time=init_time, init_meta=init_meta,
+                init_method=init_meta.get("init_method_used"))
     meta.update(_loss_fn_meta(loss_fn))
     if cell_dropout is not None:
         meta["cell_dropout"] = {"shape": list(cd.shape), "mean": float(cd.mean()),
@@ -355,14 +320,6 @@ _FITTED_SCALARS = (
     "n_iter_", "converged_", "dimension_",
 )
 
-# optimiser internals kept in ``diagnostics_`` (one dict) rather than as attributes
-_DIAGNOSTIC_KEYS = (
-    "init_time", "optimizer_time", "readout_times", "init_method_used", "init_meta",
-    "init_tree_newick", "sampler_knn", "stage1_iters", "stage1_converged",
-    "stage_transition_step", "stage2_iters", "final_penalty_weight",
-    "final_ultrametric_weight", "ultrametric_target_cv", "ultrametric_init_cv",
-    "telemetry",
-)
 _CONFIG_FIELDS = frozenset(HeraclesConfig.field_names())
 _FITTED_ARRAYS = ("trees_", "full_dists_", "labels_", "coords_",
                   "coords_history_", "history_", "learned_allele_prior_", "diagnostics_")
@@ -444,9 +401,6 @@ class Heracles:
                 "instead of setting it on the estimator" % name)
         object.__setattr__(self, name, value)
 
-    def _objective_name(self):
-        return self.edit_model.name
-
     def _check_fitted(self):
         if self.labels_ is None:
             raise RuntimeError(_NOT_FIT_MSG)
@@ -489,8 +443,6 @@ class Heracles:
             char_matrix: Cells x sites DataFrame, or a CSV path.
             cell_dropout: Optional fixed dropout probability per cell and site (see :func:`embed`).
         """
-        from datetime import datetime, timezone
-
         snapshot_epochs = None
         if self.config.snapshot_every is not None and self.config.snapshot_every > 0:
             snapshot_epochs = list(range(0, self.config.max_iterations + 1,
@@ -515,9 +467,6 @@ class Heracles:
     def _fit_inner(self, char_matrix, snapshot_epochs, start_time, commit,
                    cell_dropout=None):
         """Body of ``fit()``, run with the log handlers attached."""
-        import platform
-        import resource
-        import time
         from heracles import __version__
 
         # config.json first: the input record must survive a crashed fit;
@@ -525,15 +474,12 @@ class Heracles:
         self._run_info = {"git_commit": commit, "package_version": __version__,
                           "timestamp": start_time}
         self._write_config_json(self.outdir)
-
         logger.info(
             "fit start: edit_model=%s init_method=%s "
             "max_iterations=%d device=%s version=%s git=%s outdir=%s",
-            self._objective_name(), self.config.init_method,
+            self.edit_model.name, self.config.init_method,
             self.config.max_iterations, self._device, __version__, commit,
             self.outdir)
-
-        captured_warnings = []
         t0 = time.perf_counter()
 
         cfg, init_dists = self.config, None
@@ -544,49 +490,71 @@ class Heracles:
             cfg = cfg.replace(init_method="mds")      # tree distances are embedded directly
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            emb = embed(
-                char_matrix, config=cfg,
-                edit_model=self.edit_model,
-                init_dists=init_dists,
-                snapshot_epochs=snapshot_epochs,
-                cell_dropout=cell_dropout)
-            captured_warnings.extend(caught)
-
+            emb = embed(char_matrix, config=cfg, edit_model=self.edit_model,
+                        init_dists=init_dists, snapshot_epochs=snapshot_epochs,
+                        cell_dropout=cell_dropout)
+        captured = [str(w.message) for w in caught]
         for w in caught:
             logger.warning(str(w.message), extra={"file_only": True})
             warnings.warn(w.message, category=w.category, stacklevel=3)
-
         elapsed = time.perf_counter() - t0
         peak_gpu_mb = None
         if torch.cuda.is_available() and str(resolve_device(self._device)).startswith("cuda"):
             peak_gpu_mb = torch.cuda.max_memory_allocated() / 1024 ** 2
-        mem1 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # macOS reports bytes, Linux reports kilobytes
-        scale = 1 if platform.system() == "Linux" else 1024
-        peak_mb = mem1 / scale / 1024
+        peak_mb = peak_rss_mb()
 
+        self._record_embedding(emb)
+        if not self.converged_ and self.config.convergence_thresh is not None:
+            loss = self.history_["loss"]
+            msg = (f"the loss was still improving when the fit reached max_iterations="
+                   f"{self.config.max_iterations} (last loss "
+                   f"{loss[-1] if loss else float('nan'):.6g}); the trees use "
+                   f"the final embedding. To fit longer raise max_iterations; to stop "
+                   f"sooner raise convergence_thresh.")
+            captured.append(msg)
+            logger.warning(msg, extra={"file_only": True})
+            warnings.warn(msg, stacklevel=3)
+
+        self.trees_ = {}
+        self.save()
+        logger.info("pre-readout save -> %s/model.npz", os.path.basename(self.outdir))
+        self._build_readouts(emb, char_matrix)
+
+        diag = self.diagnostics_
+        diag["telemetry"] = self._telemetry(emb, commit, start_time, elapsed, peak_mb, peak_gpu_mb,
+                                            captured)
+        logger.info(
+            "fit complete: %.1fs total (init %.1fs, optimizer %.1fs, "
+            "readouts %.1fs), n_iter=%d, converged=%s, peak_rss=%s MB",
+            time.perf_counter() - t0,
+            diag["init_time"] or 0.0, diag["optimizer_time"] or 0.0,
+            sum(diag["readout_times"].values()), self.n_iter_, self.converged_,
+            "%.0f" % peak_mb if peak_mb is not None else "?")
+        self.save()
+        return self
+
+    def _record_embedding(self, emb):
+        """Sets the fitted attributes and ``diagnostics_`` from an :func:`embed` result."""
         meta = emb["meta"]
         history = meta.get("history", {"loss": []})
-        loss_history = history.get("loss", [])
-        n_iter = meta.get("n_iter", len(loss_history))
-        converged = meta.get("converged", False)
-
         self.full_dists_ = emb["full_dists"]          # None in low-memory mode
         self.labels_ = emb["labels"]
         self.history_ = history
-        self.n_iter_ = n_iter
-        self.converged_ = converged
+        self.n_iter_ = meta.get("n_iter", len(history.get("loss", [])))
+        self.converged_ = meta.get("converged", False)
         self.mutation_rate_ = meta.get("mutation_rate")
         self.heritable_eps_ = meta.get("heritable_eps")
-        self.stochastic_delta_ = meta.get("stochastic_delta")     # per-site: site mean
-        self.stochastic_delta_sites_ = meta.get("stochastic_delta_sites")   # (S,) list or None
-        self.stochastic_delta_cassettes_ = meta.get("stochastic_delta_cassettes")   # (C,) list or None
+        self.stochastic_delta_ = meta.get("stochastic_delta")
+        self.stochastic_delta_sites_ = meta.get("stochastic_delta_sites")
+        self.stochastic_delta_cassettes_ = meta.get("stochastic_delta_cassettes")
         self.initiation_ratio_ = (meta.get("initiation_ratio_learned")
                                   or meta.get("initiation_ratio"))
         self.coords_ = meta.get("coords")
         self.dimension_ = meta.get("dimension")
+        self.coords_history_ = meta.get("snapshots") or None
+        self.learned_allele_prior_ = meta.get("learned_allele_prior")
         init_meta = dict(meta.get("init_meta") or {})
-        diag = self.diagnostics_ = {
+        self.diagnostics_ = {
             "init_time": meta.get("init_time"),
             "optimizer_time": meta.get("optimizer_time"),
             "readout_times": {},
@@ -595,43 +563,26 @@ class Heracles:
             "init_meta": init_meta,
             "sampler_knn": emb.get("sampler_knn"),     # k actually used (low_memory sets a default)
         }
-        diag.update({k: meta.get(k) for k in (
+        self.diagnostics_.update({k: meta.get(k) for k in (
             "stage1_iters", "stage1_converged", "stage_transition_step", "stage2_iters",
             "final_penalty_weight", "final_ultrametric_weight", "ultrametric_target_cv",
             "ultrametric_init_cv")})
 
-        if snapshot_epochs and "snapshots" in meta:
-            self.coords_history_ = meta["snapshots"]
-        else:
-            self.coords_history_ = None
-
-        self.learned_allele_prior_ = meta.get("learned_allele_prior")
-
-        if not converged and self.config.convergence_thresh is not None:
-            _last = loss_history[-1] if loss_history else float("nan")
-            msg = (f"the loss was still improving when the fit reached max_iterations="
-                   f"{self.config.max_iterations} (last loss {_last:.6g}); the trees use "
-                   f"the final embedding. To fit longer raise max_iterations; to stop "
-                   f"sooner raise convergence_thresh.")
-            captured_warnings.append(msg)
-            logger.warning(msg, extra={"file_only": True})
-            warnings.warn(msg, stacklevel=3)
-
-        self.trees_ = {}
-        self.save()
-        logger.info("pre-readout save -> %s/model.npz",
-                     os.path.basename(self.outdir))
+    def _build_readouts(self, emb, char_matrix):
+        """Builds every read-out tree and the collapsed form of the first one."""
+        times = self.diagnostics_["readout_times"]
         for r in self.readouts:
-            _t_ro = time.perf_counter()
+            t_ro = time.perf_counter()
             self.trees_[r] = READOUTS[r](emb)
-            diag["readout_times"][r] = time.perf_counter() - _t_ro
-            logger.info("readout %s: %.2fs", r, diag["readout_times"][r])
+            times[r] = time.perf_counter() - t_ro
+            logger.info("readout %s: %.2fs", r, times[r])
         self._add_collapsed(self.readouts[0], char_matrix)
 
-        n_cells = len(self.labels_)
-        n_sites = int(np.asarray(emb["states_aug"]).shape[1])
-
-        diag["telemetry"] = {
+    def _telemetry(self, emb, commit, start_time, elapsed, peak_mb, peak_gpu_mb, warnings_seen):
+        """The run record kept in ``diagnostics_["telemetry"]``: timings, memory, platform."""
+        diag = self.diagnostics_
+        init_meta = diag["init_meta"]
+        return {
             "git_commit": commit,
             "start_time": start_time,
             "elapsed_s": elapsed,
@@ -645,8 +596,8 @@ class Heracles:
             "readout_times_s": dict(diag["readout_times"]),
             "peak_rss_mb": peak_mb,
             "peak_gpu_mb": peak_gpu_mb,
-            "n_cells": n_cells,
-            "n_sites": n_sites,
+            "n_cells": len(self.labels_),
+            "n_sites": int(np.asarray(emb["states_aug"]).shape[1]),
             "platform": platform.platform(),
             "processor": platform.processor() or platform.machine(),
             "cpu_count": os.cpu_count(),
@@ -654,19 +605,8 @@ class Heracles:
             "torch_version": torch.__version__,
             "torch_device": str(resolve_device(self._device)),
             "geoopt_version": geoopt.__version__,
-            "warnings": [str(w.message) if hasattr(w, "message") else str(w)
-                         for w in captured_warnings],
+            "warnings": list(warnings_seen),
         }
-
-        logger.info(
-            "fit complete: %.1fs total (init %.1fs, optimizer %.1fs, "
-            "readouts %.1fs), n_iter=%d, converged=%s, peak_rss=%.0f MB",
-            time.perf_counter() - t0,
-            diag["init_time"] or 0.0, diag["optimizer_time"] or 0.0,
-            sum(diag["readout_times"].values()), n_iter, converged, peak_mb)
-
-        self.save()
-        return self
 
     def polish(self, char_matrix, readout="nj", *, write=True, **kwargs):
         """Improves a read-out tree with likelihood NNI moves (:mod:`heracles.polish.nni`).
@@ -777,7 +717,6 @@ class Heracles:
         *device* (default: the fit's device).  With *save*, re-saves the model,
         writing ``tree_<name>.nwk``.  Returns a dict of the new trees by name.
         """
-        import time
         self._check_fitted()
         if isinstance(names, str):
             names = [names]
@@ -804,8 +743,6 @@ class Heracles:
 
     def _add_collapsed(self, name, char_matrix):
         """Adds ``trees_[name + "_collapsed"]``: ``trees_[name]`` with edit-free edges contracted."""
-        import time
-        from heracles.trees.collapse import sokal_collapse
         t0 = time.perf_counter()
         states, labels = load_character_matrix(char_matrix,
                                                missing_state=self.config.missing_state)
@@ -845,25 +782,13 @@ class Heracles:
             raise ValueError("%s is not a model.npz written by Heracles.save()" % (path,))
         meta = json.loads(str(data["_metadata_json"]))
 
-        cfg, ignored = HeraclesConfig.from_params(meta)
-        edit_model = model_from_legacy_params(meta)
-        bookkeeping = {"__version__", "readouts", "objective", "outdir", "fitted", "labels",
-                       "trees_nwk", "telemetry", "device", "edit_model", "likelihood",
-                       "dropout_unit", "cassette_size", "initiation_ratio",
-                       "learn_initiation_ratio", "stochastic_delta_per_site",
-                       "patience", "check_every", "torch_compile", "compile", "init_tree"}
-        dropped = sorted(k for k in ignored if k not in bookkeeping)
-        if dropped:
-            logger.info("load: ignoring keys not in HeraclesConfig: %s", ", ".join(dropped))
-        # An archive from another machine: fall back to the npz's directory
-        # (nothing is written there unless fit() is called again).
-        outdir = meta.get("outdir") or os.path.dirname(os.path.abspath(path))
+        cfg, _ = HeraclesConfig.from_params(meta)
+        edit_model = get_model(meta["edit_model"])
+        npz_dir = os.path.dirname(os.path.abspath(path))
+        outdir = meta.get("outdir") or npz_dir
         if not os.path.isdir(os.path.dirname(os.path.abspath(outdir))):
-            outdir = os.path.dirname(os.path.abspath(path))
-        # a saved 'rapidnj' read-out is the 'nj' read-out (NJ built with RapidNJ)
-        readouts = list(dict.fromkeys("nj" if r == "rapidnj" else r
-                                      for r in (meta.get("readouts") or ["nj"])))
-        obj = cls(outdir=outdir, readouts=readouts, config=cfg,
+            outdir = npz_dir
+        obj = cls(outdir=outdir, readouts=list(meta.get("readouts") or ["nj"]), config=cfg,
                   edit_model=edit_model)
 
         obj.full_dists_ = data["full_dists"] if "full_dists" in data else None
@@ -874,7 +799,7 @@ class Heracles:
         fitted = meta.get("fitted", {})
         for k in _FITTED_SCALARS:
             setattr(obj, k, fitted.get(k))
-        obj.diagnostics_ = meta.get("diagnostics") or _diagnostics_from_flat_keys(meta)
+        obj.diagnostics_ = meta.get("diagnostics")
         if "coords" in data:
             obj.coords_ = data["coords"]
             # the coordinates fix the dimension; a recorded dimension_ that

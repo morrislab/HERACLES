@@ -540,60 +540,40 @@ def test_two_rate_matches_matrix_exp(K, alpha):
         got[:, :, forward], ref[:, :, forward], atol=1e-4, rtol=1e-4)
 
 
-# banded sampler is shared with the Cas9 quartet objective
+# the quartet sampler is shared with the Cas9 quartet objective
 
-def test_build_banded_sampler_plain_draw_matches_direct_sampler():
-    """No ramp, no local outgroups: identical quartets to sample_quartets_banded."""
-    from heracles.embedding.sampler import (build_banded_sampler, build_tau_neighbours,
-                                            sample_quartets_banded)
+def test_build_quartet_sampler_draw_matches_direct_sampler():
+    """The shared builder draws the same quartets as sample_quartets_neighbourhood."""
+    from heracles.embedding.sampler import (build_quartet_sampler, build_tau_topk,
+                                            sample_quartets_neighbourhood)
     K, A, C = 3, 5, 6
     states = _toy_cassettes(30, C=C, K=K, n_alleles=A, seed=3)
     est = sc.cassette_seed_distances(states, K)
-    sampler, cfg, stats = build_banded_sampler(
-        est, states.shape[0], band_kmin=2, band_kmax=16, band_kmax_end=None,
-        band_local_frac=0.0, band_local_mult_max=None)
-    order, tau = build_tau_neighbours(est)
+    sampler, cfg, stats = build_quartet_sampler(est, states.shape[0], sampler_max_k=16)
+    order, tau_knn, tau = build_tau_topk(est, 16)
+    tau_t = torch.as_tensor(tau)
     g1 = torch.Generator().manual_seed(7)
     g2 = torch.Generator().manual_seed(7)
     q_shared = sampler(30, 40, generator=g1)
-    q_direct, _ = sample_quartets_banded(
-        30, 40, generator=g2, order=torch.as_tensor(order),
-        tau=torch.as_tensor(tau, dtype=torch.float64), kmin=2, kmax=16)
+    q_direct, _ = sample_quartets_neighbourhood(
+        30, 40, generator=g2, order=order, tau_knn=tau_knn, tau_fn=lambda i, j: tau_t[i, j], max_k=16)
     assert torch.equal(q_shared, q_direct)
-    assert cfg == {"kmin": 2, "kmax": 16, "kmax_end": None, "local_frac": 0.0,
-                   "local_mult_max": None, "tau_source": "est_dists"}
-    assert "kmax_effective" not in stats
+    assert cfg == {"strategy": "neighbourhood", "max_k": 16, "table_k": 16, "tau_source": "est_dists"}
+    assert 0.0 < stats["accept_rate"] <= 1.0
 
 
-def test_build_banded_sampler_ramps_kmax_over_ramp_steps():
-    from heracles.embedding.sampler import build_banded_sampler
-    K, A, C = 3, 5, 6
-    states = _toy_cassettes(40, C=C, K=K, n_alleles=A, seed=4)
-    est = sc.cassette_seed_distances(states, K)
-    sampler, cfg, stats = build_banded_sampler(
-        est, states.shape[0], band_kmax=16, band_kmax_end=32, ramp_steps=4)
-    assert cfg["kmax_end"] == 32
-    seen = []
-    g = torch.Generator().manual_seed(0)
-    for _ in range(6):
-        sampler(40, 20, generator=g)
-        seen.append(stats["kmax_effective"])
-    assert seen == [16, 20, 24, 28, 32, 32]
-
-
-def test_sequential_embed_records_local_outgroup_sampler_config():
-    """The banded-sampler options reach the sequential likelihood and its metadata."""
+def test_sequential_embed_records_the_sampler_config():
+    """The sampler options reach the sequential likelihood and its metadata."""
     K, A, C = 3, 5, 4
     states = _toy_cassettes(24, C=C, K=K, n_alleles=A, seed=5)
-    _, meta = _fit_sequential(states, K, dimension=4, max_iterations=20, seed=0,
-                              band_kmin=2, band_kmax=4, band_kmax_end=8,
-                              band_local_frac=1.0, band_local_mult_max=4)
+    _, meta = _fit_sequential(states, K, dimension=4, max_iterations=20, seed=0, sampler_max_k=8)
     cfg = meta["quartet_sampler_config"]
-    assert cfg["kmax_end"] == 8 and cfg["local_frac"] == 1.0
-    assert cfg["local_mult_max"] == 4.0
+    assert cfg["strategy"] == "neighbourhood" and cfg["max_k"] == 8 and cfg["table_k"] == 8
     stats = meta["quartet_sampler_stats"]
-    assert stats["local_frac_accepted"] > 0.0
-    assert "kmax_effective" in stats
+    assert 0.0 < stats["accept_rate"] <= 1.0
+    _, meta = _fit_sequential(states, K, dimension=4, max_iterations=20, seed=0,
+                              sampler_strategy="uniform")
+    assert meta["quartet_sampler_config"] == {"strategy": "uniform"}
 
 
 def test_cas9_and_sequential_loss_factories_share_sampler_config():
@@ -602,10 +582,9 @@ def test_cas9_and_sequential_loss_factories_share_sampler_config():
     states = _toy_cassettes(20, C=C, K=K, n_alleles=A, seed=6)
     est = sc.cassette_seed_distances(states, K)
     m = states.shape[0]
-    kw = dict(est_dists=est, band_kmin=2,
-              band_kmax=8, band_kmax_end=32, band_local_frac=0.5,
-              band_local_mult_max=4)
+    from heracles.config import HeraclesConfig
+    kw = dict(est_dists=est, config=HeraclesConfig(sampler_max_k=8))
     cas9 = quartet_loss_fn(states, _prior(A), m, **kw)
-    seq = sc.sequential_quartet_loss_fn(states, _prior(A), m, cassette_size=K, quartet_sampler="banded", **kw)
+    seq = sc.sequential_quartet_loss_fn(states, _prior(A), m, cassette_size=K, **kw)
     assert cas9.quartet_sampler_config == seq.quartet_sampler_config
 

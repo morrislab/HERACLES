@@ -1,44 +1,60 @@
-"""Run bookkeeping: git commit of the code, per-fit log handlers, device choice."""
+"""Run bookkeeping: git commit of the code, peak memory, per-fit log handlers, device choice."""
 
 import logging
 import os
+import platform
 import subprocess
 
 import torch
 
+try:
+    import resource
+except ImportError:          # not a Unix platform
+    resource = None
+
 
 __all__ = [
-    'git_commit',
-    'setup_run_logging',
-    'teardown_run_logging',
-    'resolve_device',
+    "git_commit",
+    "peak_rss_mb",
+    "setup_run_logging",
+    "teardown_run_logging",
+    "resolve_device",
 ]
 
 
-def git_commit(repo_dir=None):
-    """Returns the short git hash of the heracles checkout, or None outside git.
+def _git(args, cwd):
+    return subprocess.check_output(["git"] + args, cwd=cwd,
+                                   stderr=subprocess.DEVNULL).decode().strip()
 
-    The hash ends in ``"+dirty"`` if the working tree has uncommitted changes.
+
+def git_commit(repo_dir=None):
+    """Returns the short git hash of a heracles source checkout, or None.
+
+    None for an installed package (no checkout of heracles contains it) or
+    without git.  The hash ends in ``"+dirty"`` if the working tree has
+    uncommitted changes.
     """
     if repo_dir is None:
-        repo_dir = os.path.dirname(__file__)
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
     try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=repo_dir, stderr=subprocess.DEVNULL,
-        ).decode().strip()
-    except Exception:
-        return None
-    try:
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain"],
-            cwd=repo_dir, stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        if dirty:
+        top = _git(["rev-parse", "--show-toplevel"], repo_dir)
+        if not repo_dir.startswith(os.path.join(top, "heracles")):
+            return None
+        commit = _git(["rev-parse", "--short", "HEAD"], repo_dir)
+        if _git(["status", "--porcelain"], repo_dir):
             commit += "+dirty"
-    except Exception:
-        pass
+    except (OSError, subprocess.CalledProcessError):
+        return None
     return commit
+
+
+def peak_rss_mb():
+    """Peak resident memory of this process in MB, or None where it cannot be read."""
+    if resource is None:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    scale = 1 if platform.system() == "Linux" else 1024      # Linux: kB; macOS, BSD: bytes
+    return peak / scale / 1024
 
 
 def setup_run_logging(outdir, level=logging.INFO):
@@ -71,11 +87,8 @@ def setup_run_logging(outdir, level=logging.INFO):
 def teardown_run_logging(run_logger, handlers, prev_level):
     """Removes and closes the handlers added by :func:`setup_run_logging`."""
     for h in handlers:
-        try:
-            run_logger.removeHandler(h)
-            h.close()
-        except Exception:
-            pass
+        run_logger.removeHandler(h)
+        h.close()
     run_logger.setLevel(prev_level)
 
 

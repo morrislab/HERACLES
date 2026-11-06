@@ -14,7 +14,7 @@ from conftest import _toy_states
 from heracles import Heracles
 from heracles.models import (MODELS, PROCESSES, CassetteDropout, Cas9Model, Cas9Process,
                              CustomModel, EditProcess, PETracerModel, SequentialModel,
-                             SequentialProcess, SiteDropout, get_model, model_from_legacy_params,
+                             SequentialProcess, SiteDropout, get_model,
                              register_process)
 from heracles.embedding.objective import quartet_loss_fn
 
@@ -106,35 +106,6 @@ def test_custom_process_plugs_in(tmp_path):
             m.polish(_cm())
     finally:
         PROCESSES.pop("plain_hamming_test", None)
-
-
-def test_legacy_config_keys_map_to_models():
-    assert model_from_legacy_params({}) == Cas9Model()
-    assert model_from_legacy_params({"stochastic_delta_per_site": True}) == \
-        Cas9Model(separate_dropout_rates=True)
-    assert model_from_legacy_params({"dropout_unit": "cassette", "cassette_size": 3,
-                                     "stochastic_delta_per_site": True}) == \
-        PETracerModel(cassette_size=3, separate_dropout_rates=True)
-    assert model_from_legacy_params({"likelihood": "sequential", "cassette_size": 5,
-                                     "initiation_ratio": 2.0}) == \
-        SequentialModel(cassette_size=5, initiation_ratio=2.0)
-
-
-def test_load_maps_flat_model_keys_to_edit_model(tmp_path):
-    """load() builds the edit model from the flat dropout_unit / likelihood keys
-    that model.npz files without an edit_model entry carry."""
-    m = Heracles(edit_model=PETracerModel(cassette_size=2), outdir=tmp_path / "old",
-                 **_FAST).fit(_cm(S=6))
-    path = os.path.join(m.outdir, "model.npz")
-    data = dict(np.load(path, allow_pickle=False))
-    meta = json.loads(str(data["_metadata_json"]))
-    meta.pop("edit_model")
-    meta.update(dropout_unit="cassette", cassette_size=2, likelihood="cas9",
-                stochastic_delta_per_site=False)
-    data["_metadata_json"] = np.array(json.dumps(meta))
-    old = os.path.join(tmp_path, "old_format.npz")
-    np.savez(old, **data)
-    assert Heracles.load(old).edit_model == PETracerModel(cassette_size=2)
 
 
 def test_cli_rejects_option_of_another_model():

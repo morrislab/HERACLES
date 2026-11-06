@@ -1,38 +1,71 @@
-"""The banded local-outgroup quartet sampler.
+"""The quartet samplers: neighbourhood (the default) and uniform.
 
-Quartets are drawn so that each cell is paired with relatives ranked by
-estimated common-ancestor depth, from close neighbours out to a local
-outgroup. :func:`build_banded_sampler` builds the sampler from a distance
-matrix or, without one, from k-NN tables computed directly from the
-character matrix; :func:`sample_quartets_banded` draws a batch.
+The neighbourhood sampler draws every quartet from one cell's neighbourhood:
+the cells are ranked by estimated common-ancestor depth, a neighbourhood size
+is drawn log-uniformly, and the three partners come from inside it
+(:func:`sample_quartets_neighbourhood`). The uniform sampler draws four
+distinct cells at random (:func:`sample_quartets_uniform`).
+
+Samplers are looked up by name in :data:`SAMPLERS`, the value of the
+``sampler_strategy`` option.  To add one, register a builder::
+
+    from heracles.embedding.sampler import register_sampler
+
+    @register_sampler("mine")
+    def build_mine(est_dists, n_points, *, sampler_max_k, sampler_knn,
+                   character_matrix, missing_state, device):
+        def sampler(n_leaves, n_quartets, generator=None, device=None):
+            ...                      # (n_quartets, 4) distinct taxa in 1..n_leaves
+            return quartets
+        return sampler, {"strategy": "mine"}, {}
+
+and fit with ``Heracles(sampler_strategy="mine")``.  The builder gets the
+``(n_points, n_points)`` founder-augmented seed distances (``None`` in
+low-memory mode, where ``sampler_knn`` and ``character_matrix`` are set
+instead) and returns the sampler, a dict recording its settings and a dict it
+may update with per-batch statistics.  A one-off sampler can also be passed
+directly as ``quartet_loss_fn(..., sampler=callable)``.
 """
 
 import logging
 import math
-import time as _time
+import time
 import warnings
 
 import numpy as np
 import torch
 
-from heracles.constants import (HAMMING_ROW_CHUNK, LOCAL_RING_MULT, QUARTETS_PER_CELL,
-                                SAMPLER_RAMP_STEPS)
-from heracles.embedding.ctmc import (
-    sample_distinct,
-)
+from heracles.constants import HAMMING_ROW_CHUNK, QUARTETS_PER_CELL, SAMPLER_MAX_K
+from heracles.embedding.ctmc import sample_distinct
+from heracles.embedding.initialization import seed_distances
 
 logger = logging.getLogger("heracles")
 
 
 __all__ = [
-    'build_tau_neighbours',
-    'build_tau_neighbours_from_cm',
-    'sample_quartets_banded',
-    'banded_sampler_reach',
-    'n_distinct_quartets',
-    'default_batch_size',
-    'build_banded_sampler',
+    "SAMPLERS",
+    "register_sampler",
+    "build_tau_neighbours",
+    "build_tau_neighbours_from_cm",
+    "build_tau_topk",
+    "sample_quartets_neighbourhood",
+    "sample_quartets_uniform",
+    "sampler_reach",
+    "n_distinct_quartets",
+    "default_batch_size",
+    "build_quartet_sampler",
 ]
+
+#: quartet sampler builders by ``sampler_strategy`` name (see the module docstring)
+SAMPLERS = {}
+
+
+def register_sampler(name):
+    """Decorator: make a sampler builder available as ``sampler_strategy=name``."""
+    def deco(builder):
+        SAMPLERS[name] = builder
+        return builder
+    return deco
 
 
 def _stratified_quartets(n_leaves, n_quartets, generator=None, device=None):
@@ -54,6 +87,37 @@ def _stratified_quartets(n_leaves, n_quartets, generator=None, device=None):
     return torch.cat(chunks)[:n_quartets]
 
 
+def sample_quartets_uniform(n_leaves, n_quartets, generator=None, device=None):
+    """Sample ``n_quartets`` quartets of distinct leaves uniformly from taxa ``1..n_leaves``.
+
+    Every unordered quartet is equally likely, so the minibatch gradient is an
+    unbiased estimate of the full quartet composite likelihood. The founder
+    (index 0) never appears; it enters only through the depths.
+
+    Returns:
+        tuple: ``(quartets, stats)``: a (B, 4) long tensor of distinct 1-based
+        taxon indices, and an empty stats dict.
+    """
+    if n_leaves < 4:
+        raise ValueError(
+            "need at least 4 leaves to sample quartets, got %d" % n_leaves)
+    return sample_distinct(n_leaves, 4, n_quartets, generator, device), {}
+
+
+def _tau_matrix(dists):
+    """``(n, n)`` common-ancestor depths from a founder-augmented ``(n+1, n+1)`` distance matrix.
+
+    ``tau_ij = (d(0,i) + d(0,j) - d(i,j)) / 2``, clamped at 0, zero diagonal.
+    """
+    d = np.asarray(dists, dtype=np.float64)
+    d0 = d[0, 1:]
+    D = d[1:, 1:]
+    tau = 0.5 * (d0[:, None] + d0[None, :] - D)
+    np.clip(tau, 0.0, None, out=tau)
+    np.fill_diagonal(tau, 0.0)
+    return tau
+
+
 def build_tau_neighbours(dists):
     """Common-ancestor depths and a neighbour ranking from a founder-augmented distance matrix.
 
@@ -68,41 +132,13 @@ def build_tau_neighbours(dists):
         ties by ascending index. Both use 0-based leaf indices (leaf i is taxon
         i + 1).
     """
-    d = np.asarray(dists, dtype=np.float64)
-    d0 = d[0, 1:]
-    D = d[1:, 1:]
-    tau = 0.5 * (d0[:, None] + d0[None, :] - D)
-    np.clip(tau, 0.0, None, out=tau)
-    np.fill_diagonal(tau, 0.0)
-
+    tau = _tau_matrix(dists)
     n = tau.shape[0]
     # Rank by descending tau, then drop each leaf's own column wherever it landed.
     order_full = np.argsort(-tau, axis=1, kind="stable")
     keep = order_full != np.arange(n)[:, None]
     order = order_full[keep].reshape(n, n - 1)
     return order, tau
-
-
-def _topk_stable_rows(tau_chunk, k, self_idx):
-    """Per row, the ``k`` largest-tau leaves (excluding the leaf itself), ordered as a stable full sort would."""
-    nrows, n = tau_chunk.shape
-    order = np.empty((nrows, k), dtype=np.int64)
-    vals = np.empty((nrows, k), dtype=np.float64)
-    for r in range(nrows):
-        neg = -tau_chunk[r]
-        neg[self_idx[r]] = np.inf                     # never its own neighbour
-        if k >= n - 1:
-            idx = np.argsort(neg, kind="stable")[:k]
-        else:
-            part = np.argpartition(neg, k - 1)[:k]
-            v = neg[part].max()                       # k-th smallest value
-            below = np.flatnonzero(neg < v)
-            ties = np.flatnonzero(neg == v)
-            idx = np.concatenate([below, ties[:k - len(below)]])
-            idx = idx[np.lexsort((idx, neg[idx]))]  # by (-tau, index)
-        order[r] = idx
-        vals[r] = -neg[idx]
-    return order, vals
 
 
 def _edited_fraction(cm, missing_state):
@@ -173,19 +209,60 @@ def build_tau_neighbours_from_cm(cm, k, missing_state=-1, device=None, row_chunk
             tau = 0.5 * (d_root_t[i0:i1, None] + d_root_t[None, :] - D)
             tau.clamp_(min=0.0)
             tau[torch.arange(r, device=dev), ar_n[i0:i1]] = -float("inf")   # never itself
-            # exact stable top-k: everything above the k-th value, then the
-            # lowest-index ties at that value, ordered by (-tau, index)
-            kth = torch.topk(tau, k, dim=1).values[:, -1]
-            above = tau > kth[:, None]
-            ties = tau == kth[:, None]
-            n_above = above.sum(1)
-            take = above | (ties & (ties.cumsum(1) <= (k - n_above)[:, None]))
-            sel_idx = take.nonzero(as_tuple=True)[1].view(r, k)     # index-ascending per row
-            sel_tau = tau.gather(1, sel_idx)
-            srt = torch.sort(-sel_tau, dim=1, stable=True).indices
-            order[i0:i1] = sel_idx.gather(1, srt).cpu().numpy()
-            tau_knn[i0:i1] = sel_tau.gather(1, srt).cpu().numpy()
+            sel_idx, sel_tau = _stable_topk(tau, k)
+            order[i0:i1] = sel_idx.cpu().numpy()
+            tau_knn[i0:i1] = sel_tau.cpu().numpy()
     return order, tau_knn, d_root
+
+
+def _stable_topk(tau, k):
+    """Per row, the ``k`` largest entries ordered by (-tau, index), as a stable full sort would give.
+
+    Everything above the k-th value, then the lowest-index ties at that value.
+    Returns ``(indices, values)``, both (rows, k).
+    """
+    r = tau.shape[0]
+    kth = torch.topk(tau, k, dim=1).values[:, -1]
+    above = tau > kth[:, None]
+    ties = tau == kth[:, None]
+    n_above = above.sum(1)
+    take = above | (ties & (ties.cumsum(1) <= (k - n_above)[:, None]))
+    sel_idx = take.nonzero(as_tuple=True)[1].view(r, k)     # index-ascending per row
+    sel_tau = tau.gather(1, sel_idx)
+    srt = torch.sort(-sel_tau, dim=1, stable=True).indices
+    return sel_idx.gather(1, srt), sel_tau.gather(1, srt)
+
+
+def build_tau_topk(dists, k, row_chunk=1024):
+    """Top-``k`` neighbour ranking and the tau matrix from a founder-augmented distance matrix.
+
+    The ranking is the first ``k`` columns of :func:`build_tau_neighbours`
+    (same tau, same tie order), found in row blocks instead of a full (n, n) sort.
+
+    Args:
+        dists: (n+1, n+1) distances, founder at index 0.
+        k: neighbours to keep per leaf (capped at n - 1).
+        row_chunk: rows per block.
+
+    Returns:
+        tuple: ``(order, tau_knn, tau)``: the (n, k) 0-based neighbour indices by
+        descending tau, the matching tau values, and the (n, n) tau matrix of
+        :func:`build_tau_neighbours`.
+    """
+    tau = _tau_matrix(dists)
+    n = tau.shape[0]
+    k = min(int(k), n - 1)
+    tau_t = torch.from_numpy(tau)
+    order = np.empty((n, k), dtype=np.int64)
+    tau_knn = np.empty((n, k), dtype=np.float64)
+    for i0 in range(0, n, row_chunk):
+        i1 = min(i0 + row_chunk, n)
+        rows = tau_t[i0:i1].clone()
+        rows[torch.arange(i1 - i0), torch.arange(i0, i1)] = -float("inf")   # never itself
+        sel_idx, sel_tau = _stable_topk(rows, k)
+        order[i0:i1] = sel_idx.numpy()
+        tau_knn[i0:i1] = sel_tau.numpy()
+    return order, tau_knn, tau
 
 
 def _build_tau_neighbours_from_cm_numpy(cm, k, missing_state=-1):
@@ -199,14 +276,15 @@ def _build_tau_neighbours_from_cm_numpy(cm, k, missing_state=-1):
     order = np.empty((n, k), dtype=np.int64)
     tau_knn = np.empty((n, k), dtype=np.float64)
 
-    from heracles.embedding.initialization import seed_distances
     for i0 in range(0, n, HAMMING_ROW_CHUNK):
         i1 = min(i0 + HAMMING_ROW_CHUNK, n)
         D_chunk = seed_distances(cm, np.arange(i0, i1), missing_state=missing_state)
         tau_chunk = 0.5 * (d_root[i0:i1, None] + d_root[None, :] - D_chunk)
         np.clip(tau_chunk, 0.0, None, out=tau_chunk)
-        order[i0:i1], tau_knn[i0:i1] = _topk_stable_rows(
-            tau_chunk, k, np.arange(i0, i1))
+        rows = torch.from_numpy(tau_chunk)
+        rows[torch.arange(i1 - i0), torch.arange(i0, i1)] = -float("inf")   # never itself
+        sel_idx, sel_tau = _stable_topk(rows, k)
+        order[i0:i1], tau_knn[i0:i1] = sel_idx.numpy(), sel_tau.numpy()
 
     return order, tau_knn, d_root
 
@@ -240,159 +318,107 @@ def _make_tau_fn(cm, d_root, missing_state=-1, device=None):
     return tau_fn
 
 
-def sample_quartets_banded(n_leaves, n_quartets, generator=None, device=None,
-                           order=None, tau=None, kmin=2, kmax=16,
-                           oversample=3, max_rounds=8, tau_has_signal=None,
-                           local_frac=0.0, local_mult_max=None,
-                           tau_fn=None):
-    """Sample quartets whose first pair are close relatives, so edges above small clades get signal.
+def _log_uniform_rank(shape, n_avail, kw):
+    """1-based ranks ``floor(exp(U log(n_avail + 1)))``, each in ``[1, n_avail]``."""
+    log_top = math.log(n_avail + 1.0)
+    return torch.exp(torch.rand(*shape, **kw).double() * log_top).long().clamp_(1, n_avail)
 
-    Each proposal draws a rank bound ``k`` log-uniformly in ``[kmin, kmax]``, a
-    leaf ``a``, a neighbour ``b`` of ``a`` with tau rank below ``k``, and ``c, d``
-    uniformly. For a ``local_frac`` share of proposals ``c`` is instead drawn
-    just beyond ``b`` in ``a``'s ranking (a local outgroup). A proposal is
-    accepted when the four leaves are distinct and
-    ``max(tau_ac, tau_ad, tau_bc, tau_bd) < tau_ab``.
+
+def _resolve_max_k(max_k, n_leaves):
+    """Neighbourhood cap as a leaf count: None stays None, a value <= 1 is a fraction of the leaves."""
+    if max_k is None:
+        return None
+    v = float(max_k)
+    if v <= 0:
+        raise ValueError("max_k must be positive, got %r" % (max_k,))
+    return max(3, int(round(v * n_leaves)) if v <= 1.0 else int(v))
+
+
+def _neighbourhood_draw(M, n_avail, kw, k_max=None):
+    """Three distinct sorted neighbour columns below a size ``k`` drawn log-uniformly over ``[3, k_max]``.
+
+    ``k_max`` defaults to ``n_avail`` (every column of the ranking).
+    """
+    top = n_avail if k_max is None else min(max(int(k_max), 3), n_avail)
+    k = _log_uniform_rank((M,), top, kw)
+    k = k.clamp_(min=min(3, n_avail))
+    # three distinct columns below k: draw from shrinking ranges and step over taken ones
+    x1 = (torch.rand(M, **kw).double() * k).long()
+    x2 = (torch.rand(M, **kw).double() * (k - 1)).long()
+    x2 = x2 + (x2 >= x1).long()
+    lo, hi = torch.minimum(x1, x2), torch.maximum(x1, x2)
+    x3 = (torch.rand(M, **kw).double() * (k - 2)).long()
+    x3 = x3 + (x3 >= lo).long()
+    x3 = x3 + (x3 >= hi).long()
+    col, _ = torch.stack([x1, x2, x3], dim=1).sort(dim=1)
+    return col
+
+
+def sample_quartets_neighbourhood(n_leaves, n_quartets, generator=None, device=None,
+                                  order=None, tau_knn=None, tau_fn=None, max_k=None,
+                                  oversample=3, max_rounds=8):
+    """Quartets from one leaf's neighbourhood: ``b, c, d`` drawn together from its ``k`` nearest.
+
+    Each proposal draws a leaf ``a`` and a neighbourhood size ``k``
+    log-uniform over ``[3, K]``, then three distinct leaves uniformly from
+    ``a``'s ``k`` nearest neighbours; the nearest of the three becomes ``b``.
+    All four leaves therefore sit in one neighbourhood whose size is spread
+    evenly over every doubling, so edges above small clades and deep edges get
+    quartets alike. ``K`` is ``max_k`` (None: every other leaf; a value <= 1:
+    that fraction of the leaves), capped at the columns of ``order``. A
+    proposal is accepted when the four leaves are distinct and
+    ``max(tau_ac, tau_ad, tau_bc, tau_bd) < tau_ab``; after ``max_rounds`` the
+    remainder is filled with uniform quartets.
 
     Args:
         n_leaves: leaves are taxa ``1..n_leaves``.
         n_quartets: batch size B.
         generator: torch CPU generator, or None.
         device: device of the returned tensor.
-        order: neighbour ranking from :func:`build_tau_neighbours` or a k-NN variant.
-        tau: (n, n) tau matrix; give this or ``tau_fn``.
-        kmin, kmax: neighbour-rank band, clamped to the columns of ``order``.
+        order: (n, K) neighbour ranking by descending tau (0-based leaf indices).
+        tau_knn: (n, K) tau of each leaf with the neighbours in ``order``; the
+            pairs with ``a`` are read from it.
+        tau_fn: callable ``(i, j) -> tau`` on 0-based leaf indices, for the
+            pairs ``(b, c)`` and ``(b, d)``.
+        max_k: cap on the neighbourhood size (see above).
         oversample: proposals drawn per still-needed quartet each round.
         max_rounds: rounds before the remainder is filled with uniform quartets.
-        tau_has_signal: precomputed ``(tau > 0).any()``; computed when None.
-        local_frac: share of proposals with a local-outgroup ``c``, in [0, 1].
-        local_mult_max: if set (>= 1), ``c``'s rank is drawn from ``[r+1, (r+1) m)``,
-            with ``r`` the rank of ``b`` and ``m`` log-uniform in
-            ``[1, local_mult_max]``; if None, from the fixed ring ``[k, 4k)``.
-        tau_fn: callable ``(i, j) -> tau`` on 0-based leaf indices, used when
-            ``tau`` is None.
 
     Returns:
-        tuple: ``(quartets, stats)``. ``quartets`` is a (B, 4) long tensor of
-        distinct 1-based taxon indices. ``stats`` holds ``accept_rate``,
-        ``fallback_frac`` (share filled uniformly), ``local_frac_accepted`` and
-        ``degenerate``. When tau is zero everywhere the batch is uniform, a
-        warning is issued, ``degenerate`` is True and ``local_frac_accepted`` is
-        absent.
-
-    Raises:
-        ValueError: if ``n_leaves < 4``, ``order`` is missing, neither ``tau`` nor
-            ``tau_fn`` is given, or ``local_frac`` or ``local_mult_max`` is out of
-            range.
+        tuple: ``(quartets, stats)``: a (B, 4) long tensor of distinct 1-based
+        taxon indices, and ``accept_rate`` / ``fallback_frac``.
     """
     if n_leaves < 4:
-        raise ValueError(
-            "need at least 4 leaves to sample quartets, got %d" % n_leaves)
-    if order is None:
-        raise ValueError(
-            "sample_quartets_banded needs `order` from build_tau_neighbours")
-    if tau is None and tau_fn is None:
-        raise ValueError(
-            "sample_quartets_banded needs `tau` (n, n) or `tau_fn` (callable)")
-
-    if tau_has_signal is None:   # not precomputed by the caller: check per call
-        if tau is not None:
-            tau_has_signal = (bool((tau > 0).any()) if torch.is_tensor(tau)
-                              else bool(np.any(np.asarray(tau) > 0.0)))
-        else:
-            tau_has_signal = True  # tau_fn mode; assume signal exists
-    if not tau_has_signal:
-        # Degenerate input: every pair meets at the founder, so no pair is "closer" than
-        # any other and the acceptance test max(cross) < tau_ab can never hold. Happens
-        # for an all-zero or fully-missing character matrix. Fall back to uniform rather
-        # than spinning through max_rounds and silently returning a uniform batch anyway.
-        warnings.warn(
-            "banded quartet sampler: tau is entirely zero (no pair is closer than any "
-            "other), falling back to uniform sampling", stacklevel=2)
-        out = sample_distinct(n_leaves, 4, n_quartets, generator, device)
-        return out, {"accept_rate": 0.0, "fallback_frac": 1.0, "degenerate": True}
-
-    n_avail = order.shape[1]
-    lo = max(1, min(int(kmin), n_avail))
-    hi = max(lo, min(int(kmax), n_avail))
-    log_lo, log_hi = math.log(lo), math.log(hi)
-    local_frac = float(local_frac)
-    if not 0.0 <= local_frac <= 1.0:
-        raise ValueError("local_frac must be in [0, 1], got %r" % (local_frac,))
-    if local_mult_max is not None and float(local_mult_max) < 1.0:
-        raise ValueError("local_mult_max must be >= 1, got %r" % (local_mult_max,))
-
+        raise ValueError("need at least 4 leaves to sample quartets, got %d" % n_leaves)
+    if order is None or tau_knn is None or tau_fn is None:
+        raise ValueError("sample_quartets_neighbourhood needs `order`, `tau_knn` and `tau_fn`")
     order_t = torch.as_tensor(order, dtype=torch.long)
-    if tau is not None:
-        tau_t = torch.as_tensor(tau, dtype=torch.float64)
-    else:
-        tau_t = None
-    _tau = tau_fn if tau_t is None else lambda i, j: tau_t[i, j]
+    tau_knn_t = torch.as_tensor(tau_knn, dtype=torch.float64)
+    n_avail = order_t.shape[1]
+    k_max = _resolve_max_k(max_k, n_leaves)
     kw = {"generator": generator} if generator is not None else {}
 
-    kept = []
-    got = 0
-    drawn = 0
-    n_ok = 0
-    n_ok_local = 0
+    kept, got, drawn, n_ok = [], 0, 0, 0
     for _ in range(max_rounds):
         need = n_quartets - got
         if need <= 0:
             break
         M = max(int(need * oversample), 1)
-        drawn += M
-
-        u = torch.rand(M, **kw)
-        k = torch.exp(u * (log_hi - log_lo) + log_lo).long().clamp_(1, n_avail)
         a = torch.randint(0, n_leaves, (M,), **kw)
-        r = (torch.rand(M, **kw) * k).long().clamp_(0, n_avail - 1)
-        b = order_t[a, r]
-        c = torch.randint(0, n_leaves, (M,), **kw)
-        d = torch.randint(0, n_leaves, (M,), **kw)
-        is_local = torch.zeros(M, dtype=torch.bool)
-        if local_frac > 0.0:
-            # c from a's rank band [k, LOCAL_RING_MULT k): the nearest leaves outside
-            # the band b came from, i.e. the sister-group candidates. Falls back to
-            # uniform c when the band would run past the last neighbour.
-            is_local = torch.rand(M, **kw) < local_frac
-            if local_mult_max is None:
-                r_lo = k
-                r_hi = torch.minimum(int(LOCAL_RING_MULT) * k, torch.full_like(k, n_avail))
-            else:
-                # Anchor just past b's own rank r and reach a log-uniform multiple
-                # of it, so c concentrates on the next-most-similar cells.
-                log_m = torch.rand(M, **kw) * math.log(float(local_mult_max))
-                r_lo = r + 1
-                r_hi = torch.ceil(r_lo.double() * torch.exp(log_m)).long()
-                r_hi = torch.maximum(r_hi, r_lo + 1)
-                r_hi = torch.minimum(r_hi, torch.full_like(k, n_avail))
-            width = (r_hi - r_lo).clamp_min(0)
-            r_c = r_lo + (torch.rand(M, **kw) * width).long()
-            r_c = r_c.clamp_(0, n_avail - 1)
-            c_local = order_t[a, r_c]
-            is_local &= width > 0
-            c = torch.where(is_local, c_local, c)
-
+        drawn += M
+        col = _neighbourhood_draw(M, n_avail, kw, k_max)
+        rows = a[:, None].expand(M, 3)
+        nb = order_t[rows, col]
+        t_a = tau_knn_t[rows, col]                  # tau of a with b, c, d
+        b, c, d = nb.unbind(1)
         q = torch.stack([a, b, c, d], dim=1)
         srt, _ = q.sort(dim=1)
         distinct = (srt[:, 1:] > srt[:, :-1]).all(dim=1)
-
-        if tau_t is None:
-            # one gather for all five pairs (fewer launches when tau_fn is on a GPU)
-            t_all = _tau(torch.cat([a, a, a, b, b]), torch.cat([b, c, d, c, d])).view(5, M)
-            t_ab = t_all[0]
-            cross = torch.maximum(torch.maximum(t_all[1], t_all[2]),
-                                  torch.maximum(t_all[3], t_all[4]))
-        else:
-            t_ab = _tau(a, b)
-            cross = torch.maximum(torch.maximum(_tau(a, c), _tau(a, d)),
-                                  torch.maximum(_tau(b, c), _tau(b, d)))
-        ok = distinct & (cross < t_ab).to(distinct.device)
-        # Count acceptances before truncating to `need`: `got/drawn` would be capped
-        # at 1/oversample and report the fill rate rather than the acceptance rate.
+        t_b = tau_fn(torch.cat([b, b]), torch.cat([c, d])).view(2, M).to(t_a.device)
+        cross = torch.maximum(torch.maximum(t_a[:, 1], t_a[:, 2]),
+                              torch.maximum(t_b[0], t_b[1]))
+        ok = distinct & (cross < t_a[:, 0])
         n_ok += int(ok.sum())
-        n_ok_local += int((ok & is_local).sum())
-
         take = q[ok][:need]
         if take.numel():
             kept.append(take)
@@ -400,34 +426,35 @@ def sample_quartets_banded(n_leaves, n_quartets, generator=None, device=None,
 
     n_fallback = n_quartets - got
     if n_fallback > 0:
-        # Never hang: top up with uniform quartets and report how many.
         kept.append(sample_distinct(n_leaves, 4, n_fallback, generator, None) - 1)
-
-    out = (torch.cat(kept)[:n_quartets] + 1)
+    out = torch.cat(kept)[:n_quartets] + 1
     if device is not None:
         out = out.to(device)
-    stats = {"accept_rate": (n_ok / drawn) if drawn else 0.0,
-             "fallback_frac": n_fallback / max(n_quartets, 1),
-             "local_frac_accepted": (n_ok_local / n_ok) if n_ok else 0.0,
-             "degenerate": False}
-    return out, stats
+    return out, {"accept_rate": (n_ok / drawn) if drawn else 0.0,
+                 "fallback_frac": n_fallback / max(n_quartets, 1)}
 
 
-def banded_sampler_reach(band_kmax, band_kmax_end=None, band_local_frac=0.0,
-                         band_local_mult_max=None):
-    """Largest neighbour rank :func:`sample_quartets_banded` can read with these settings.
+def sampler_reach(sampler_strategy, sampler_max_k, n_leaves):
+    """Neighbours per leaf the quartet sampler reads, or None when it needs no ranking.
 
-    A k-NN table (``sampler_knn``) with at least this many columns yields
-    exactly the same proposals as the full ranking; low-memory mode uses it as
-    the default ``sampler_knn``.
+    For the neighbourhood sampler this is the cap ``sampler_max_k`` (a count,
+    a fraction <= 1 of ``n_leaves``, or every other leaf when None). A k-NN
+    table (``sampler_knn``) with this many columns yields exactly the same
+    proposals as the full ranking, so low-memory mode uses it as the default
+    ``sampler_knn``. The uniform sampler reads no ranking.
     """
-    kmax = int(band_kmax)
-    if band_kmax_end is not None:
-        kmax = max(kmax, int(band_kmax_end))
-    if float(band_local_frac) <= 0.0:
-        return kmax
-    mult = LOCAL_RING_MULT if band_local_mult_max is None else float(band_local_mult_max)
-    return int(math.ceil(kmax * mult))
+    check_strategy(sampler_strategy)
+    if sampler_strategy == "uniform":
+        return None
+    k = _resolve_max_k(sampler_max_k, n_leaves)
+    return n_leaves - 1 if k is None else min(k, n_leaves - 1)
+
+
+def check_strategy(sampler_strategy):
+    """Raises ``ValueError`` unless *sampler_strategy* names a registered sampler."""
+    if sampler_strategy not in SAMPLERS:
+        raise ValueError("sampler_strategy must be one of %s, got %r"
+                         % (", ".join(SAMPLERS), sampler_strategy))
 
 
 def n_distinct_quartets(n):
@@ -440,37 +467,125 @@ def default_batch_size(n):
     return min(QUARTETS_PER_CELL * n, n_distinct_quartets(n))
 
 
-def _band_defaults(**given):
-    """Fill ``None`` band settings from the ``HeraclesConfig`` defaults."""
-    from heracles.config import HeraclesConfig
-    defaults = HeraclesConfig()
-    return {k: (getattr(defaults, k) if v is None else v) for k, v in given.items()}
+def _check_est_dists(est_dists, n_points):
+    """``est_dists`` as an array, checked to be the founder-augmented (n_points, n_points) matrix."""
+    if est_dists is None:
+        raise ValueError(
+            "the quartet sampler needs est_dists (the (n_points, n_points) "
+            "founder-augmented distance matrix); got None")
+    est_arr = np.asarray(est_dists)
+    if est_arr.shape != (n_points, n_points):
+        raise ValueError(
+            "est_dists must be the (n_points, n_points) founder-augmented "
+            "matrix, got %r for n_points=%d; passing the leaf-only "
+            "(n, n) block would shift every index by one"
+            % (est_arr.shape, n_points))
+    return est_arr
 
 
-def build_banded_sampler(est_dists, n_points, *, band_kmin=None, band_kmax=None,
-                         band_kmax_end="default", band_local_frac=None,
-                         band_local_mult_max="default", ramp_steps=SAMPLER_RAMP_STEPS,
-                         sampler_knn=None, character_matrix=None,
-                         missing_state=-1,
-                         device=None):
-    """Build the banded quartet sampler used by the quartet objective.
+def _uniform_sampler(degenerate=False):
+    """The uniform sampler; ``degenerate`` marks the neighbourhood sampler's fallback."""
+    sampler_stats = {}
 
-    Band settings left unset take the :class:`heracles.config.HeraclesConfig`
-    defaults. ``band_kmax_end`` and ``band_local_mult_max`` accept None as a
-    real value, so their "unset" marker is the string ``"default"``.
+    def sampler(n_leaves, n_quartets, generator=None, device=None):
+        q, s = sample_quartets_uniform(n_leaves, n_quartets, generator=generator, device=device)
+        sampler_stats.update(s)
+        return q
+
+    sampler_config = {"strategy": "uniform"}
+    if degenerate:
+        sampler_config["degenerate"] = True
+    return sampler, sampler_config, sampler_stats
+
+
+@register_sampler("uniform")
+def build_uniform_sampler(est_dists, n_points, **_unused):
+    """``sampler_strategy="uniform"``: :func:`sample_quartets_uniform`, no distances needed."""
+    return _uniform_sampler()
+
+
+@register_sampler("neighbourhood")
+def build_neighbourhood_sampler(est_dists, n_points, *, sampler_max_k=SAMPLER_MAX_K,
+                                sampler_knn=None, character_matrix=None, missing_state=-1,
+                                device=None):
+    """``sampler_strategy="neighbourhood"``: :func:`sample_quartets_neighbourhood`.
+
+    Keeps each leaf's top-K neighbours with their tau (K = the neighbourhood
+    cap, or ``sampler_knn`` columns in low-memory mode). Tau for the pairs
+    without the first leaf comes from the full tau matrix, or in low-memory mode
+    is computed on the fly from the character matrix.
+    """
+    n = n_points - 1
+    k_max = _resolve_max_k(sampler_max_k, n)
+    t0 = time.perf_counter()
+    if sampler_knn is not None:
+        if character_matrix is None:
+            raise ValueError("sampler_knn needs character_matrix (the k-NN tables "
+                             "are built from the characters)")
+        cm_leaves = np.asarray(character_matrix)[1:]  # drop founder row
+        k_table = min(int(sampler_knn), n - 1)
+        order, tau_knn, d_root = build_tau_neighbours_from_cm(
+            cm_leaves, k_table, missing_state=missing_state, device=device)
+        tau_fn = _make_tau_fn(cm_leaves, d_root, missing_state=missing_state, device=device)
+        tau_source = "knn_%d" % k_table
+    else:
+        k_table = n - 1 if k_max is None else min(k_max, n - 1)
+        order, tau_knn, tau = build_tau_topk(_check_est_dists(est_dists, n_points), k_table)
+        tau_t = torch.as_tensor(tau, dtype=torch.float64)
+
+        def tau_fn(i, j):
+            return tau_t[i, j]
+        tau_source = "est_dists"
+    if not bool((tau_knn > 0).any()):
+        # Degenerate input: every pair meets at the founder, so no pair is "closer"
+        # than any other and the acceptance test can never hold. Happens for an
+        # all-zero or fully-missing character matrix. Draw uniformly instead of
+        # spinning through max_rounds and silently returning a uniform batch anyway.
+        warnings.warn(
+            "neighbourhood quartet sampler: tau is entirely zero (no pair is closer "
+            "than any other), falling back to uniform sampling", stacklevel=3)
+        return _uniform_sampler(degenerate=True)
+    order = torch.as_tensor(order, dtype=torch.long)
+    tau_knn = torch.as_tensor(tau_knn, dtype=torch.float64)
+    logger.info("neighbourhood sampler: top-%d table for n=%d (%.1f MB), max_k=%s, tau %s; %.1fs on %s",
+                k_table, n, (order.nelement() * 8 + tau_knn.nelement() * 8) / 1024 / 1024,
+                k_max, "from the full matrix" if tau_source == "est_dists" else "on the fly",
+                time.perf_counter() - t0, device or "cpu")
+    sampler_stats = {}
+
+    def sampler(n_leaves, n_quartets, generator=None, device=None):
+        q, s = sample_quartets_neighbourhood(n_leaves, n_quartets, generator=generator,
+                                             device=device, order=order, tau_knn=tau_knn,
+                                             tau_fn=tau_fn, max_k=k_max)
+        sampler_stats.update(s)
+        return q
+
+    sampler_config = {"strategy": "neighbourhood", "max_k": sampler_max_k, "table_k": k_table,
+                      "tau_source": tau_source}
+    return sampler, sampler_config, sampler_stats
+
+
+def build_quartet_sampler(est_dists, n_points, *, sampler_strategy="neighbourhood",
+                          sampler_max_k=SAMPLER_MAX_K, sampler_knn=None, character_matrix=None,
+                          missing_state=-1, device=None):
+    """Build the quartet sampler named by *sampler_strategy* (see :data:`SAMPLERS`).
 
     Args:
         est_dists: (n_points, n_points) founder-augmented seed distances. May be
-            None when ``sampler_knn`` and ``character_matrix`` are both given.
+            None when ``sampler_knn`` and ``character_matrix`` are both given,
+            or for the uniform sampler.
         n_points: number of points including the founder.
-        band_kmin, band_kmax, band_local_frac, band_local_mult_max: see
-            :func:`sample_quartets_banded`.
-        band_kmax_end: if set, ``kmax`` ramps linearly from ``band_kmax`` to this
-            value over the first ``ramp_steps`` sampler calls (one call per step).
+        sampler_strategy: a key of :data:`SAMPLERS`: "neighbourhood" (default;
+            :func:`sample_quartets_neighbourhood`) or "uniform"
+            (:func:`sample_quartets_uniform`, which needs no distances).
+        sampler_max_k: "neighbourhood" only: cap on the neighbourhood size
+            (None = every other leaf; a value <= 1 is a fraction of the leaves).
+            Each leaf keeps only that many neighbours.
         sampler_knn: if an int k, keep only the top-k neighbours per leaf (O(n k)
-            memory) and compute tau on the fly; None keeps the full (n, n) tau.
+            memory), built from ``character_matrix``, and compute tau on the
+            fly; None works from ``est_dists``.
         character_matrix: (n_points, S) states with the founder at row 0; used
-            for the on-the-fly tau when ``sampler_knn`` is set.
+            for the k-NN table and the on-the-fly tau when ``sampler_knn`` is set.
         missing_state: value marking missing entries.
         device: device for the k-NN table and the on-the-fly tau.
 
@@ -478,90 +593,14 @@ def build_banded_sampler(est_dists, n_points, *, band_kmin=None, band_kmax=None,
         tuple: ``(sampler, sampler_config, sampler_stats)``. ``sampler`` is called
         as ``sampler(n_leaves, n_quartets, generator=None, device=None)``, returns
         a (B, 4) tensor and updates the ``sampler_stats`` dict in place on every
-        call. ``sampler_config`` records the band settings used.
+        call. ``sampler_config`` records the settings used.
 
     Raises:
-        ValueError: if ``est_dists`` is needed but missing, or its shape is not
-            (n_points, n_points) (a leaf-only matrix would shift every index by one).
+        ValueError: for an unknown strategy, or if ``est_dists`` is needed but
+            missing or its shape is not (n_points, n_points) (a leaf-only matrix
+            would shift every index by one).
     """
-    d = _band_defaults(band_kmin=band_kmin, band_kmax=band_kmax, band_local_frac=band_local_frac)
-    band_kmin, band_kmax, band_local_frac = d["band_kmin"], d["band_kmax"], d["band_local_frac"]
-    if band_kmax_end == "default":
-        band_kmax_end = _band_defaults(band_kmax_end=None)["band_kmax_end"]
-    if band_local_mult_max == "default":
-        band_local_mult_max = _band_defaults(band_local_mult_max=None)["band_local_mult_max"]
-    _band_tau_fn = None
-    if sampler_knn is not None:
-        k = int(sampler_knn)
-        if character_matrix is None:
-            raise ValueError("sampler_knn needs character_matrix (the k-NN tables "
-                             "are built from the characters)")
-        cm_leaves = np.asarray(character_matrix)[1:]  # drop founder row
-        _t_knn = _time.perf_counter()
-        _band_order, _tau_knn, _d_root = build_tau_neighbours_from_cm(
-            cm_leaves, k, missing_state=missing_state, device=device)
-        logger.info("k-NN table from the character matrix: %.1fs on %s",
-                    _time.perf_counter() - _t_knn, device or "cpu")
-        _band_tau_fn = _make_tau_fn(
-            cm_leaves, _d_root, missing_state=missing_state, device=device)
-        _band_order = torch.as_tensor(_band_order, dtype=torch.long)
-        _band_tau = None
-        _band_has_signal = bool((_tau_knn > 0).any())
-        logger.info("k-NN sampler: k=%d, n=%d (%.1f MB order + on-the-fly tau)",
-                     k, n_points - 1,
-                     _band_order.nelement() * 8 / 1024 / 1024)
-    else:
-        if est_dists is None:
-            raise ValueError(
-                "the banded sampler needs est_dists (the (n_points, n_points) "
-                "founder-augmented distance matrix); got None")
-        est_arr = np.asarray(est_dists)
-        if est_arr.shape != (n_points, n_points):
-            raise ValueError(
-                "est_dists must be the (n_points, n_points) founder-augmented "
-                "matrix, got %r for n_points=%d; passing the leaf-only "
-                "(n, n) block would shift every index by one"
-                % (est_arr.shape, n_points))
-        _band_order, _band_tau = build_tau_neighbours(est_arr)
-        _band_order = torch.as_tensor(_band_order, dtype=torch.long)
-        _band_tau = torch.as_tensor(_band_tau, dtype=torch.float64)
-        _band_has_signal = bool((_band_tau > 0).any())
-    _sampler_step = [0]
-    sampler_stats = {}
-
-    if band_kmax_end is not None and band_kmax_end != band_kmax:
-        _kmax_start = float(band_kmax)
-        _kmax_end = float(band_kmax_end)
-
-        def sampler(n_leaves, n_quartets, generator=None, device=None):
-            t = _sampler_step[0]
-            _sampler_step[0] = t + 1
-            kmax_t = int(round(_kmax_start + (_kmax_end - _kmax_start)
-                               * min(t / float(ramp_steps), 1.0)))
-            kmax_t = max(int(band_kmin), kmax_t)
-            q, s = sample_quartets_banded(
-                n_leaves, n_quartets, generator=generator, device=device,
-                order=_band_order, tau=_band_tau, kmin=band_kmin, kmax=kmax_t,
-                tau_has_signal=_band_has_signal, local_frac=band_local_frac,
-                local_mult_max=band_local_mult_max, tau_fn=_band_tau_fn)
-            s["kmax_effective"] = kmax_t
-            sampler_stats.update(s)
-            return q
-    else:
-        def sampler(n_leaves, n_quartets, generator=None, device=None):
-            q, s = sample_quartets_banded(
-                n_leaves, n_quartets, generator=generator, device=device,
-                order=_band_order, tau=_band_tau, kmin=band_kmin, kmax=band_kmax,
-                tau_has_signal=_band_has_signal, local_frac=band_local_frac,
-                local_mult_max=band_local_mult_max, tau_fn=_band_tau_fn)
-            sampler_stats.update(s)
-            return q
-
-    _tau_source = "knn_%d" % sampler_knn if sampler_knn else "est_dists"
-    sampler_config = {"kmin": int(band_kmin), "kmax": int(band_kmax),
-                      "kmax_end": int(band_kmax_end) if band_kmax_end is not None else None,
-                      "local_frac": float(band_local_frac),
-                      "local_mult_max": (float(band_local_mult_max)
-                                         if band_local_mult_max is not None else None),
-                      "tau_source": _tau_source}
-    return sampler, sampler_config, sampler_stats
+    check_strategy(sampler_strategy)
+    return SAMPLERS[sampler_strategy](
+        est_dists, n_points, sampler_max_k=sampler_max_k, sampler_knn=sampler_knn,
+        character_matrix=character_matrix, missing_state=missing_state, device=device)

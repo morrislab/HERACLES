@@ -12,8 +12,8 @@ Tests:
      triple_site_logprob sums to 1
   5. gradient flow: the quartet objective has finite, non-zero gradients
   6. end to end: embed() reduces the loss; Heracles().fit(cm) produces trees
-  7. quartet samplers: the banded sampler is the default and draws valid,
-     close-relative quartets
+  7. quartet samplers: the neighbourhood sampler is the default and its
+     settings are recorded; a custom sampler can replace it
 """
 
 import itertools
@@ -411,7 +411,7 @@ def test_gradient_flows_through_quartet_objective():
     states = _toy_states(n=8, S=4, K=3)
     ql = build_allele_priors(states, prior="global_uniform")
     dim = 3
-    manifold, _ = lorentz_manifold(dim)
+    manifold = lorentz_manifold(dim)
     est = _hamming(states)
     torch.manual_seed(42)
     pts, _ = init_points(manifold, dim, seed_dists=est, init_method="mds")
@@ -445,7 +445,7 @@ def test_quartet_loss_exposes_gromov_penalty_from_its_likelihood_batch():
     """The quartet treelike penalty reuses, rather than resamples, its batch."""
     states = _toy_states(n=8, S=5, K=3)
     ql = build_allele_priors(states, prior="global_uniform")
-    manifold, _ = lorentz_manifold(3)
+    manifold = lorentz_manifold(3)
     points, _ = init_points(manifold, 3, seed_dists=_hamming(states), init_method="mds")
     loss_fn = quartet_loss_fn(states, ql, states.shape[0], batch_size=12,
                                sampler=_stratified_quartets)
@@ -491,25 +491,27 @@ def test_heracles_quartet_integration(tmp_path):
 
 # 7. Quartet samplers
 
-def test_quartet_sampler_is_banded_by_default_and_overridable():
-    """The banded sampler is the default; a custom sampler is recorded by name."""
+def test_quartet_sampler_is_neighbourhood_by_default_and_overridable():
+    """The neighbourhood sampler is the default; a custom sampler is recorded by name."""
     from heracles.embedding.objective import quartet_loss_fn
-    # A real matrix, not an all-zero one: the banded sampler needs a tau with some
-    # structure, and an all-unedited matrix has none by construction.
+    # A real matrix, not an all-zero one: the neighbourhood sampler needs a tau with
+    # some structure, and an all-unedited matrix has none by construction.
     states = _toy_states(n=12, S=8, K=4, seed=0)
     est = _hamming(states)
     prior = np.ones(5) / 5.0
     m = states.shape[0]
     fn = quartet_loss_fn(states, prior, m, est_dists=est)
-    assert fn.quartet_sampler == "banded" and fn.quartet_sampler_config is not None
-    assert fn.meta["quartet_sampler"] == "banded"
+    assert fn.quartet_sampler == "neighbourhood" and fn.quartet_sampler_config is not None
+    assert fn.meta["quartet_sampler"] == "neighbourhood"
+    from heracles.config import HeraclesConfig
+    fn_u = quartet_loss_fn(states, prior, m, config=HeraclesConfig(sampler_strategy="uniform"))
+    assert fn_u.quartet_sampler == "uniform" and fn_u.quartet_sampler_config == {"strategy": "uniform"}
     fn2 = quartet_loss_fn(states, prior, m, sampler=_stratified_quartets)
     assert fn2.quartet_sampler == "_stratified_quartets"
     assert fn2.quartet_sampler_config is None
 
 
-# depth-banded sampler
-def _banded_setup(n=30, S=20, K=5, seed=0):
+def _tau_setup(n=30, S=20, K=5, seed=0):
     """(order, tau, states, est) for a small non-degenerate character matrix."""
     from heracles.embedding.sampler import build_tau_neighbours
     states = _toy_states(n=n, S=S, K=K, seed=seed)
@@ -520,7 +522,7 @@ def _banded_setup(n=30, S=20, K=5, seed=0):
 
 def test_build_tau_neighbours_matches_the_upgma_construction():
     """tau is the same founder-referenced depth matrix the UPGMA read-out builds."""
-    order, tau, _, est = _banded_setup(n=12, S=10)
+    order, tau, _, est = _tau_setup(n=12, S=10)
     d0, D = est[0, 1:], est[1:, 1:]
     expected = np.clip(0.5 * (d0[:, None] + d0[None, :] - D), 0.0, None)
     np.fill_diagonal(expected, 0.0)
@@ -531,95 +533,17 @@ def test_build_tau_neighbours_matches_the_upgma_construction():
 
 def test_build_tau_neighbours_excludes_each_leaf_from_its_own_ranking():
     """A leaf must never be offered as its own close relative."""
-    order, tau, _, _ = _banded_setup(n=20)
+    order, tau, _, _ = _tau_setup(n=20)
     assert bool((order != np.arange(20)[:, None]).all())
     # Ranking is by descending tau.
     ranked = np.take_along_axis(tau, order, axis=1)
     assert bool((np.diff(ranked, axis=1) <= 1e-12).all())
 
 
-def test_banded_sampler_returns_valid_distinct_quartets():
-    from heracles.embedding.sampler import sample_quartets_banded
-    order, tau, _, _ = _banded_setup(n=30)
-    q, stats = sample_quartets_banded(30, 400, generator=torch.Generator().manual_seed(0),
-                                      order=order, tau=tau)
-    assert q.shape == (400, 4)
-    assert int(q.min()) >= 1 and int(q.max()) <= 30
-    srt = q.sort(dim=1).values
-    assert bool((srt[:, 1:] > srt[:, :-1]).all()), "a row repeated a taxon"
-    assert stats["fallback_frac"] == 0.0 and not stats["degenerate"]
-
-
-def test_banded_sampler_enforces_the_cherry_condition():
-    """Every accepted quartet resolves as ab|cd; this pins the algorithm.
-
-    The four-point condition written in tau: the first pair's common ancestor must be
-    strictly deeper than any ancestor either of them shares with c or d.
-    """
-    from heracles.embedding.sampler import sample_quartets_banded
-    order, tau, _, _ = _banded_setup(n=30)
-    q, stats = sample_quartets_banded(30, 500, generator=torch.Generator().manual_seed(3),
-                                      order=order, tau=tau)
-    assert stats["fallback_frac"] == 0.0, "uniform top-up would weaken this assertion"
-    z = q.numpy() - 1
-    for a, b, c, d in z:
-        cross = max(tau[a, c], tau[a, d], tau[b, c], tau[b, d])
-        assert cross < tau[a, b]
-
-
-def test_banded_sampler_concentrates_on_close_relatives():
-    """The first pair of a banded quartet is closer than a uniformly drawn pair."""
-    from heracles.embedding.sampler import sample_quartets_banded
-    from heracles.embedding.ctmc import sample_distinct
-    order, tau, _, _ = _banded_setup(n=40)
-    qb, _ = sample_quartets_banded(40, 2000, generator=torch.Generator().manual_seed(1),
-                                   order=order, tau=tau)
-    qu = sample_distinct(40, 4, 2000, torch.Generator().manual_seed(1), None)
-    zb, zu = qb.numpy() - 1, qu.numpy() - 1
-    tau_b = tau[zb[:, 0], zb[:, 1]].mean()
-    tau_u = tau[zu[:, 0], zu[:, 1]].mean()
-    assert tau_b > tau_u, "banded first pair should be closer than a uniform pair"
-
-
-def test_banded_kmax_controls_how_far_the_band_reaches():
-    """kmax is the depth knob: a tighter band picks closer relatives."""
-    from heracles.embedding.sampler import sample_quartets_banded
-    order, tau, _, _ = _banded_setup(n=60)
-    means = []
-    for kmax in (4, 40):
-        q, _ = sample_quartets_banded(60, 2000, generator=torch.Generator().manual_seed(2),
-                                      order=order, tau=tau, kmin=2, kmax=kmax)
-        z = q.numpy() - 1
-        means.append(tau[z[:, 0], z[:, 1]].mean())
-    assert means[0] > means[1], "tight band should give a deeper shared ancestor"
-
-
-def test_banded_sampler_is_reproducible():
-    from heracles.embedding.sampler import sample_quartets_banded
-    order, tau, _, _ = _banded_setup(n=25)
-    kw = dict(order=order, tau=tau)
-    q1, _ = sample_quartets_banded(25, 300, generator=torch.Generator().manual_seed(7), **kw)
-    q2, _ = sample_quartets_banded(25, 300, generator=torch.Generator().manual_seed(7), **kw)
-    assert torch.equal(q1, q2)
-
-
-def test_banded_sampler_falls_back_when_tau_is_degenerate():
-    """All-zero tau (e.g. an all-unedited matrix) must not hang or return junk."""
-    from heracles.embedding.sampler import build_tau_neighbours, sample_quartets_banded
-    order, tau = build_tau_neighbours(np.zeros((13, 13)))
-    with pytest.warns(UserWarning, match="entirely zero"):
-        q, stats = sample_quartets_banded(12, 60, generator=torch.Generator().manual_seed(0),
-                                          order=order, tau=tau)
-    assert q.shape == (60, 4) and stats["degenerate"] is True
-    assert stats["fallback_frac"] == 1.0
-    srt = q.sort(dim=1).values
-    assert bool((srt[:, 1:] > srt[:, :-1]).all())
-
-
-def test_banded_sampler_requires_a_founder_augmented_est_dists():
+def test_neighbourhood_sampler_requires_a_founder_augmented_est_dists():
     from heracles.embedding.objective import quartet_loss_fn
     from heracles.fit import build_allele_priors
-    _, _, states, est = _banded_setup(n=12, S=10)
+    _, _, states, est = _tau_setup(n=12, S=10)
     ql = build_allele_priors(states[1:], prior="global_uniform")
     m = states.shape[0]
     with pytest.raises(ValueError, match="est_dists"):
@@ -628,59 +552,23 @@ def test_banded_sampler_requires_a_founder_augmented_est_dists():
         quartet_loss_fn(states, ql, m, est_dists=est[1:, 1:])
 
 
-def test_embed_uses_banded_sampler_and_records_its_config():
+@pytest.mark.parametrize("strategy", ["neighbourhood", "uniform"])
+def test_embed_records_the_sampler_config(strategy):
     import pandas as pd
     from heracles.fit import embed
-    _, _, states, est = _banded_setup(n=16, S=12, K=4)
+    _, _, states, est = _tau_setup(n=16, S=12, K=4)
     cm = pd.DataFrame(states[1:], index=["c%d" % i for i in range(16)])
     meta = embed(cm, dimension=3, max_iterations=60, seed=0, init_method="mds",
-                 heritable_eps=1e-5, stochastic_delta=0.1,
+                 heritable_eps=1e-5, stochastic_delta=0.1, sampler_strategy=strategy,
                  allele_prior="global_uniform")["meta"]
     hist = meta["history"]["loss"]
     assert hist[-1] < hist[0], "loss should decrease"
-    assert meta["quartet_sampler"] == "banded"
-    assert meta["quartet_sampler_config"] == {"kmin": 2, "kmax": 16, "local_frac": 1.0, "local_mult_max": 4.0,
-                                              "kmax_end": 128,
-                                              "tau_source": "est_dists"}
-    stats = meta["quartet_sampler_stats"]
-    assert 0.0 < stats["accept_rate"] <= 1.0
-    assert stats["fallback_frac"] == 0.0
-
-
-def test_banded_sampler_local_frac_draws_c_just_outside_the_band():
-    """local_frac=1 draws c from a's rank-[k, 4k) neighbours; local_frac=0 matches the default draw exactly."""
-    from heracles.embedding.sampler import sample_quartets_banded
-    order, tau, _, _ = _banded_setup(n=40, S=30)
-    q0, s0 = sample_quartets_banded(40, 300, generator=torch.Generator().manual_seed(1),
-                                    order=order, tau=tau, kmin=2, kmax=8)
-    q0b, _ = sample_quartets_banded(40, 300, generator=torch.Generator().manual_seed(1),
-                                    order=order, tau=tau, kmin=2, kmax=8, local_frac=0.0)
-    assert torch.equal(q0, q0b) and s0["local_frac_accepted"] == 0.0
-    q1, s1 = sample_quartets_banded(40, 300, generator=torch.Generator().manual_seed(1),
-                                    order=order, tau=tau, kmin=2, kmax=8, local_frac=1.0)
-    assert s1["local_frac_accepted"] > 0.9
-    a, c = (q1[:, 0] - 1).numpy(), (q1[:, 2] - 1).numpy()
-    rank_c = np.array([int(np.where(order[i] == j)[0][0]) for i, j in zip(a, c)])
-    # c never inside the tightest possible b band (rank < kmin) and never beyond 4*kmax
-    assert (rank_c >= 2).mean() > 0.9 and (rank_c < 32).all()
-    srt = q1.sort(dim=1).values
-    assert bool((srt[:, 1:] > srt[:, :-1]).all())
-    with pytest.raises(ValueError, match="local_frac"):
-        sample_quartets_banded(40, 10, order=order, tau=tau, local_frac=1.5)
-
-
-def test_banded_sampler_double_banded_c_sits_just_past_b():
-    """With local_mult_max, c's rank from a is > b's rank and within local_mult_max x (r+1)."""
-    from heracles.embedding.sampler import sample_quartets_banded
-    order, tau, _, _ = _banded_setup(n=40, S=30)
-    q, s = sample_quartets_banded(40, 400, generator=torch.Generator().manual_seed(2),
-                                  order=order, tau=tau, kmin=2, kmax=8,
-                                  local_frac=1.0, local_mult_max=4.0)
-    assert s["local_frac_accepted"] > 0.9
-    a, b, c = [(q[:, i] - 1).numpy() for i in range(3)]
-    rank = lambda i, j: int(np.where(order[i] == j)[0][0])
-    rb = np.array([rank(i, j) for i, j in zip(a, b)]); rc = np.array([rank(i, j) for i, j in zip(a, c)])
-    assert (rc > rb).mean() > 0.9
-    assert (rc < 4 * (rb + 1) + 1).mean() > 0.9
-    with pytest.raises(ValueError, match="local_mult_max"):
-        sample_quartets_banded(40, 10, order=order, tau=tau, local_frac=1.0, local_mult_max=0.5)
+    assert meta["quartet_sampler"] == strategy
+    if strategy == "neighbourhood":
+        assert meta["quartet_sampler_config"] == {"strategy": "neighbourhood", "max_k": 1024.0,
+                                                  "table_k": 15, "tau_source": "est_dists"}
+        stats = meta["quartet_sampler_stats"]
+        assert 0.0 < stats["accept_rate"] <= 1.0
+        assert stats["fallback_frac"] == 0.0
+    else:
+        assert meta["quartet_sampler_config"] == {"strategy": "uniform"}

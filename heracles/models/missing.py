@@ -23,15 +23,15 @@ import torch
 
 from heracles.models.base import MissingData, model_option, register_missing
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("heracles")
 
 
 __all__ = [
-    'SiteDropout',
-    'CassetteDropout',
-    'site_groups_from_size',
-    'cassette_missingness_report',
-    'CassetteCorrection',
+    "SiteDropout",
+    "CassetteDropout",
+    "site_groups_from_size",
+    "cassette_missingness_report",
+    "CassetteCorrection",
 ]
 
 
@@ -158,10 +158,6 @@ class CassetteCorrection:
             ``(B, S)`` tensor ``log_prob - (1 - 1/|c|) * log_prob_pattern``.
         """
         return log_prob - self.site_excess * log_prob_pattern
-
-    def expand(self, per_cassette):
-        """``(C,)`` per-cassette values -> ``(S,)`` per-site values."""
-        return per_cassette[self.groups]
 
     def log_report(self, log=logger):
         """Log the cassette counts; warn when any cassette is partially missing."""

@@ -9,9 +9,9 @@ from heracles.constants import LOG_FLOOR
 
 
 __all__ = [
-    'build_allele_priors',
-    'resolve_prior',
-    'missing_log_prior',
+    "build_allele_priors",
+    "resolve_prior",
+    "missing_log_prior",
 ]
 
 
@@ -88,6 +88,14 @@ def _gamma_from_mode_variance(mode, variance):
     return k, theta
 
 
+#: search range of the Beta concentration kappa = alpha + beta (kappa > 2 keeps a
+#: mode inside (0, 1)) and the bisection steps that pin it down
+_BETA_KAPPA_BOUNDS = (2.0001, 1e8)
+_BISECTION_STEPS = 200
+#: "auto" Beta prior variance = mode (1 - mode) / this: a weak prior around the start value
+_AUTO_BETA_VARIANCE_DIVISOR = 5
+
+
 def _beta_from_mode_variance(mode, variance):
     """Return (alpha, beta) for a Beta distribution with the given mode and variance."""
     m = float(mode)
@@ -105,8 +113,8 @@ def _beta_from_mode_variance(mode, variance):
         b = (1 - m) * (kappa - 2) + 1
         return a * b / (kappa ** 2 * (kappa + 1))
 
-    lo, hi = 2.0001, 1e8
-    for _ in range(200):
+    lo, hi = _BETA_KAPPA_BOUNDS
+    for _ in range(_BISECTION_STEPS):
         mid = (lo + hi) / 2
         if _var_at_kappa(mid) > V:
             lo = mid
@@ -133,7 +141,7 @@ def resolve_prior(init_value, prior_variance, kind):
             prior_variance = float(init_value) ** 2
         else:
             m = float(init_value)
-            prior_variance = m * (1 - m) / 5
+            prior_variance = m * (1 - m) / _AUTO_BETA_VARIANCE_DIVISOR
     prior_variance = float(prior_variance)
     if kind == "gamma":
         return _gamma_from_mode_variance(init_value, prior_variance)

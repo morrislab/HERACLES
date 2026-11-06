@@ -3,13 +3,11 @@
 Each sampled leaf quartet is scored under the irreversible-edit CTMC of
 :mod:`heracles.embedding.ctmc`. The unrooted topology is chosen from the four-point
 sums and the rooted shape (balanced or caterpillar) from the Gromov
-products. Batches come from the banded local-outgroup sampler in
+products. Batches come from the neighbourhood quartet sampler in
 :mod:`heracles.embedding.sampler`.
 
 Main entry point: :func:`quartet_loss_fn`, the loss handed to the optimiser.
 """
-
-import logging
 
 import torch
 
@@ -26,17 +24,15 @@ from heracles.embedding.ctmc import (
     _triple_site_logprob_parts,
     gromov_quartet_penalty_from_distances,
 )
-from heracles.embedding.sampler import (_stratified_quartets, build_banded_sampler,
+from heracles.embedding.sampler import (_stratified_quartets, build_quartet_sampler,
                                        default_batch_size, n_distinct_quartets)
-
-logger = logging.getLogger("heracles")
 
 
 __all__ = [
-    'quartet_branch_lengths',
-    'quartet_site_logprob',
-    'quartet_objective',
-    'quartet_loss_fn',
+    "quartet_branch_lengths",
+    "quartet_site_logprob",
+    "quartet_objective",
+    "quartet_loss_fn",
 ]
 
 
@@ -418,16 +414,13 @@ def quartet_site_logprob(states, is_balanced,
     return out
 
 
-
 def quartet_objective(states, n_points, score, *, est_dists=None, batch_size=None,
                       root_frac=1.0, root_weight=None, config=None, sampler=None,
-                      knn_from_states=False, device=None, loss_scale=1.0,
-                      band_kmin=None, band_kmax=None, band_kmax_end="default",
-                      band_local_frac=None, band_local_mult_max="default"):
+                      device=None, loss_scale=1.0):
     """The quartet composite-likelihood loss around a model's scoring function.
 
     Shared by every edit process: each step draws a quartet batch from the
-    banded sampler, computes the founder depths, the six pairwise distances and
+    quartet sampler, computes the founder depths, the six pairwise distances and
     the rooted branch lengths, hands the four-point defect and the depths to the
     optimiser's penalties, picks the leaves of the root-to-leaf term, and asks
     *score* for the log probabilities.  The loss is
@@ -440,8 +433,6 @@ def quartet_objective(states, n_points, score, *, est_dists=None, batch_size=Non
             heritable_eps, stochastic_delta) -> (logP_quartets, logP_root)``
             where ``branches`` is the tuple from :func:`quartet_branch_lengths`
             and ``leaves`` the leaf indices of the root-to-leaf term.
-        knn_from_states: let the sampler build k-NN tables from ``states``
-            (low-memory fits) when ``config.sampler_knn`` is set.
         loss_scale: divisor of the loss (e.g. sites per cassette, so a cassette
             log probability is on the per-site scale).
         Other arguments: as in :func:`quartet_loss_fn`.
@@ -455,26 +446,16 @@ def quartet_objective(states, n_points, score, *, est_dists=None, batch_size=Non
     n = n_points - 1
     if n < 4:
         raise ValueError(f"need at least 4 leaves for the quartet objective, got {n}")
-    sampler_knn = None
-    if config is not None:      # the fit's HeraclesConfig supplies unset settings
-        band_kmin = config.band_kmin if band_kmin is None else band_kmin
-        band_kmax = config.band_kmax if band_kmax is None else band_kmax
-        band_local_frac = config.band_local_frac if band_local_frac is None else band_local_frac
-        if band_kmax_end == "default":
-            band_kmax_end = config.band_kmax_end
-        if band_local_mult_max == "default":
-            band_local_mult_max = config.band_local_mult_max
-        sampler_knn = getattr(config, "sampler_knn", None)
+    sampler_kw = {}
+    if config is not None:      # the fit's HeraclesConfig supplies the sampler settings
+        sampler_kw = dict(sampler_strategy=config.sampler_strategy,
+                          sampler_max_k=config.sampler_max_k, sampler_knn=config.sampler_knn)
         if batch_size is None:
             batch_size = config.batch_size
     if sampler is None:
-        sampler_name = "banded"
-        knn = (dict(sampler_knn=sampler_knn, character_matrix=states, device=device)
-               if knn_from_states else {})
-        sampler, sampler_config, sampler_stats = build_banded_sampler(
-            est_dists, n_points, band_kmin=band_kmin, band_kmax=band_kmax,
-            band_kmax_end=band_kmax_end, band_local_frac=band_local_frac,
-            band_local_mult_max=band_local_mult_max, **knn)
+        sampler, sampler_config, sampler_stats = build_quartet_sampler(
+            est_dists, n_points, character_matrix=states, device=device, **sampler_kw)
+        sampler_name = sampler_config["strategy"]
     else:
         sampler_name = getattr(sampler, "__name__", "custom")
         sampler_config, sampler_stats = None, {}
@@ -551,14 +532,12 @@ def quartet_objective(states, n_points, score, *, est_dists=None, batch_size=Non
 @with_learnable_prior
 def quartet_loss_fn(states, get_allele_prior, n_points, *, est_dists=None, batch_size=None,
                      root_frac=1.0, root_weight=None,
-                     band_kmin=None, band_kmax=None, band_kmax_end="default",
-                     band_local_frac=None, band_local_mult_max="default",
                      device=None, sampler=None, config=None, cassette=None):
     """Return the quartet composite-likelihood loss used by :func:`heracles.fit.embed`.
 
     The loss is the negative mean log probability of a batch of quartets, mixed
     with the root-to-leaf term of :func:`heracles.embedding.ctmc.leaf_marginal_logprob`.
-    Batches come from :func:`build_banded_sampler` built on ``est_dists``,
+    Batches come from :func:`build_quartet_sampler` built on ``est_dists``,
     unless ``sampler`` is given.
 
     Args:
@@ -573,14 +552,12 @@ def quartet_loss_fn(states, get_allele_prior, n_points, *, est_dists=None, batch
             ``n_root / (batch_size + n_root)``.
         learn_allele_prior: learn the allele prior (keeping its global or
             per-site shape).
-        band_kmin, band_kmax, band_kmax_end, band_local_frac, band_local_mult_max:
-            sampler options (see :func:`build_banded_sampler`); unset values come
-            from ``config`` or the ``HeraclesConfig`` defaults.
         device: torch device for the states and the loss.
         sampler: optional callable ``(n_leaves, n_quartets, generator=None,
-            device=None)`` that replaces the banded sampler.
-        config: optional ``HeraclesConfig`` that supplies unset band settings and
-            ``sampler_knn``.
+            device=None)`` that replaces the built-in sampler.
+        config: optional ``HeraclesConfig`` that supplies the sampler settings
+            (``sampler_strategy``, ``sampler_max_k``, ``sampler_knn``) and the
+            default ``batch_size``.
         cassette: optional :class:`heracles.models.missing.CassetteDropout`; when
             given, the missing-data factors are charged once per cassette instead
             of once per site.
@@ -630,9 +607,7 @@ def quartet_loss_fn(states, get_allele_prior, n_points, *, est_dists=None, batch
     loss_fn = quartet_objective(
         states, n_points, score, est_dists=est_dists, batch_size=batch_size,
         root_frac=root_frac, root_weight=root_weight, config=config, sampler=sampler,
-        knn_from_states=True, device=device, band_kmin=band_kmin, band_kmax=band_kmax,
-        band_kmax_end=band_kmax_end, band_local_frac=band_local_frac,
-        band_local_mult_max=band_local_mult_max)
+        device=device)
     loss_fn.meta["objective"] = "quartet"
     if cassette is not None:
         loss_fn.meta.update(cassette.summary())

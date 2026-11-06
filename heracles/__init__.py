@@ -19,8 +19,7 @@ Subpackages: ``heracles.models`` (edit and missing-data models),
 ``heracles.embedding`` (the objective, sampler and optimiser),
 ``heracles.trees`` (Newick, read-outs, Camin-Sokal collapse, Robinson-Foulds)
 and ``heracles.polish`` (ancestral states, branch lengths, likelihood NNI).
-``heracles.fit.embed`` runs the fit without the estimator.  Submodules load
-on first use, so ``import heracles`` is fast.
+``heracles.fit.embed`` runs the fit without the estimator.
 """
 
 __version__ = "0.1.0"

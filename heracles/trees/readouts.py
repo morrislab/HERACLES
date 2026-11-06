@@ -18,20 +18,18 @@ from scipy.cluster.hierarchy import linkage, to_tree
 from heracles.constants import DIST_ROW_CHUNK, PHYLIP_BYTES_PER_ENTRY
 from heracles.trees.rapidnj import rapidnj_available
 from heracles.embedding.optimize import iter_dist_rows, pairwise_dists
-from heracles.trees.tree import TaxonNamespace
 from heracles.trees.utils import (
-    FOUNDER_LABEL, linkage_to_newick, nj_tree, nj_tree_from_rows, parse_newick,
-    root_on_founder,
+    FOUNDER_LABEL, linkage_to_tree, nj_tree, nj_tree_from_rows, root_on_founder,
 )
 
 logger = logging.getLogger("heracles")
 
 
 __all__ = [
-    'heracles_nj',
-    'upgma_condensed_height',
-    'heracles_upgma',
-    'READOUTS',
+    "heracles_nj",
+    "upgma_condensed_height",
+    "heracles_upgma",
+    "READOUTS",
 ]
 
 
@@ -126,9 +124,7 @@ def heracles_upgma(emb):
     labels = emb["labels"]
     cond = upgma_condensed_height(_row_blocks(emb), _n_points(emb))
     Z = linkage(cond, method="average")
-    nwk = "[&R] " + linkage_to_newick(to_tree(Z), labels) + ";"
-    return parse_newick(nwk, taxon_namespace=TaxonNamespace(labels),
-                        rooting="force-rooted")
+    return linkage_to_tree(to_tree(Z), labels)
 
 
 READOUTS = {"nj": heracles_nj, "upgma": heracles_upgma}

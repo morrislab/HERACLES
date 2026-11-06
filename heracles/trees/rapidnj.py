@@ -25,15 +25,15 @@ logger = logging.getLogger("heracles")
 
 
 __all__ = [
-    'VENDOR_DIR',
-    'PACKAGED_BINARY',
-    'SOURCES',
-    'find_compiler',
-    'source_hash',
-    'build_rapidnj',
-    'rapidnj_executable',
-    'rapidnj_available',
-    'run_rapidnj',
+    "VENDOR_DIR",
+    "PACKAGED_BINARY",
+    "SOURCES",
+    "find_compiler",
+    "source_hash",
+    "build_rapidnj",
+    "rapidnj_executable",
+    "rapidnj_available",
+    "run_rapidnj",
 ]
 
 
@@ -74,7 +74,10 @@ def source_hash():
     return h.hexdigest()[:12]
 
 
-def build_rapidnj(out_path, compiler=None, quiet=False):
+#: seconds allowed for compiling the vendored RapidNJ
+BUILD_TIMEOUT_S = 600
+
+def build_rapidnj(out_path, compiler=None):
     """Compiles the vendored RapidNJ into *out_path* and returns that path.
 
     Raises ``RuntimeError`` if no compiler is found, sources are missing, or the build fails.
@@ -90,9 +93,11 @@ def build_rapidnj(out_path, compiler=None, quiet=False):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [compiler, "-O3", "-w", "-I%s" % src, "-I%s" % (src / "distanceCalculation"),
            "-pthread"] + [str(src / s) for s in SOURCES] + ["-o", str(out_path)]
-    if not quiet:
-        logger.info("building RapidNJ with %s -> %s", compiler, out_path)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    logger.info("building RapidNJ with %s -> %s", compiler, out_path)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=BUILD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("RapidNJ build did not finish within %d s" % BUILD_TIMEOUT_S) from None
     if proc.returncode != 0:
         raise RuntimeError("RapidNJ build failed:\n%s" % proc.stderr[-4000:])
     out_path.chmod(out_path.stat().st_mode | 0o111)
@@ -157,9 +162,10 @@ def _resolve_binary_cached(build):
 def rapidnj_available():
     """Returns True if a usable RapidNJ binary is found; never raises."""
     try:
-        return rapidnj_executable() is not None
+        rapidnj_executable()
     except FileNotFoundError:
         return False
+    return True
 
 
 def run_rapidnj(phylip_path, *, timeout=None):

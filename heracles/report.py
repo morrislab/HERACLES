@@ -4,154 +4,18 @@ Users normally call :meth:`heracles.Heracles.write_report`, which runs
 :func:`save_plots` and :func:`generate_report`.
 """
 
+import base64
 import logging
 import os
+from datetime import datetime
+from io import BytesIO
 
 import numpy as np
 
 logger = logging.getLogger("heracles")
 
 
-__all__ = [
-    'generate_report',
-    'loss_curve_figure',
-    'save_plots',
-]
-
-
-def generate_report(model, path=None):
-    """Writes an HTML run report for a fitted model.
-
-    The report lists hardware, timings, memory, every setting, any warnings
-    from the fit, and the loss curve.
-
-    Args:
-        model: A fitted :class:`~heracles.Heracles`.
-        path: Output ``.html`` file (default ``<outdir>/report.html``).
-
-    Returns:
-        The path written.
-    """
-    model._check_fitted()
-    if path is None:
-        path = os.path.join(model.outdir, "report.html")
-    from heracles import __version__
-    import base64
-    from io import BytesIO
-    from datetime import datetime
-
-    diag = model.diagnostics_ or {}
-    tel = diag.get("telemetry") or {}
-
-    def _esc(s):
-        return str(s).replace("&", "&amp;").replace("<", "&lt;")
-
-    def _loss_curve_b64():
-        try:
-            import matplotlib.pyplot as plt
-        except ImportError:
-            return None          # report renders without the plot
-        result = loss_curve_figure(model)
-        if result is None:
-            return None
-        fig, _ax = result
-        buf = BytesIO()
-        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        return base64.b64encode(buf.getvalue()).decode()
-
-    # parameter table: one row per config field, grouped by section
-    param_rows = []
-    rows = [("Run", "edit model", model.edit_model.describe()),
-            ("Run", "readouts", model.readouts)]
-    for f in model.config.option_fields():
-        v = getattr(model.config, f.name)
-        if isinstance(v, np.ndarray):
-            v = "array(%s)" % "x".join(str(s) for s in v.shape)
-        elif f.name == "dimension" and v is None:
-            v = "auto, ceil(5*sqrt(n))"
-        rows.append((f.metadata["section"], f.name, v))
-    last = None
-    for section, name, value in rows:
-        param_rows.append(
-            "<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
-            % (_esc(section if section != last else ""), _esc(name), _esc(value)))
-        last = section
-
-    # fitted values
-    fitted_rows = []
-    for name, value in [
-        ("mutation_rate (%s)" % ("fitted" if model.config.learn_mutation_rate else "fixed"),
-         "%.6g" % model.mutation_rate_ if model.mutation_rate_ is not None else "n/a"),
-        ("dimension", model.dimension_ if model.dimension_ is not None else "n/a"),
-        ("heritable_eps (fitted)", "%.6g" % model.heritable_eps_ if model.heritable_eps_ is not None else "n/a"),
-        ("stochastic_delta (fitted)", "%.6g" % model.stochastic_delta_ if model.stochastic_delta_ is not None else "n/a"),
-        ("stochastic_delta per site (min..max)",
-         "%.6g..%.6g (S=%d)" % (min(model.stochastic_delta_sites_), max(model.stochastic_delta_sites_),
-                                len(model.stochastic_delta_sites_))
-         if model.stochastic_delta_sites_ else "n/a"),
-        ("stochastic_delta per cassette",
-         ", ".join("%.4g" % v for v in model.stochastic_delta_cassettes_)
-         if getattr(model, "stochastic_delta_cassettes_", None) else "n/a"),
-        ("n_iter", model.n_iter_),
-        ("converged", model.converged_),
-        ("final loss", "%.6g" % model.history_["loss"][-1] if (model.history_ or {}).get("loss") else "n/a"),
-    ]:
-        fitted_rows.append(
-            "<tr><td></td><td>%s</td><td>%s</td></tr>"
-            % (_esc(name), _esc(value)))
-    if diag.get("stage_transition_step") is not None:
-        for name, value in [
-            ("stage1_iters", diag.get("stage1_iters")),
-            ("stage1_converged", diag.get("stage1_converged")),
-            ("stage_transition_step", diag.get("stage_transition_step")),
-            ("stage2_iters", diag.get("stage2_iters")),
-        ]:
-            fitted_rows.append(
-                "<tr><td></td><td>%s</td><td>%s</td></tr>"
-                % (_esc(name), _esc(value)))
-    if model.learned_allele_prior_ is not None:
-        shape = model.learned_allele_prior_.shape
-        if len(shape) == 1:
-            desc = "(%d states) shared; saved in model.npz" % shape[0]
-        else:
-            desc = "(%d sites, %d states); saved in model.npz" % (shape[0], shape[1])
-        fitted_rows.append(
-            "<tr><td></td><td>learned_allele_prior</td><td>%s</td></tr>" % desc)
-
-    # warnings
-    warn_list = tel.get("warnings", [])
-    if warn_list:
-        warn_html = "<ul>%s</ul>" % "".join(
-            "<li>%s</li>" % _esc(w) for w in warn_list)
-    else:
-        warn_html = "<p>None.</p>"
-
-    # loss curve
-    img_b64 = _loss_curve_b64()
-    if img_b64:
-        loss_html = '<img src="data:image/png;base64,%s" style="max-width:100%%;">' % img_b64
-    else:
-        loss_html = "<p><em>matplotlib not installed; loss curve omitted.</em></p>"
-
-    elapsed = tel.get("elapsed_s")
-    elapsed_str = "%.1f s" % elapsed if elapsed is not None else "n/a"
-    peak_str = "%.0f MB" % tel.get("peak_rss_mb") if tel.get("peak_rss_mb") else "n/a"
-
-    def _fmt_time(t):
-        return "%.1f s" % t if t is not None else "n/a"
-
-    init_time_str = _fmt_time(diag.get("init_time"))
-    optimizer_time_str = _fmt_time(diag.get("optimizer_time"))
-    readout_time_rows = ""
-    if diag.get("readout_times"):
-        for rname, rt in diag["readout_times"].items():
-            readout_time_rows += (
-                "<tr><td>&emsp;Readout (%s)</td><td>%s</td></tr>\n"
-                % (_esc(rname), _esc(_fmt_time(rt)))
-            )
-
-    html = """\
+_TEMPLATE = """\
 <!DOCTYPE html>
 <html>
 <head>
@@ -178,7 +42,7 @@ def generate_report(model, path=None):
 <h1>HERACLES Run Report</h1>
 <p class="meta">Generated {timestamp} &middot; heracles {version}</p>
 
-<h2>Replicability</h2>
+<h2>Run summary</h2>
 <div class="box">
 <table>
 <tr><th>Metric</th><th>Value</th></tr>
@@ -221,14 +85,132 @@ def generate_report(model, path=None):
 
 </body>
 </html>
-""".format(
+"""
+
+
+__all__ = [
+    "generate_report",
+    "loss_curve_figure",
+    "save_plots",
+]
+
+
+def _esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;")
+
+
+def _row(cells):
+    return "<tr>%s</tr>" % "".join("<td>%s</td>" % _esc(c) for c in cells)
+
+
+def _loss_curve_b64(model):
+    """The loss curve as a base64 PNG, or None without matplotlib."""
+    result = loss_curve_figure(model)
+    if result is None:
+        return None
+    import matplotlib.pyplot as plt
+    fig, _ax = result
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _param_rows(model):
+    """One table row per setting, grouped by config section."""
+    rows = [("Run", "edit model", model.edit_model.describe()),
+            ("Run", "readouts", model.readouts)]
+    for f in model.config.option_fields():
+        v = getattr(model.config, f.name)
+        if isinstance(v, np.ndarray):
+            v = "array(%s)" % "x".join(str(s) for s in v.shape)
+        elif f.name == "dimension" and v is None:
+            v = "auto, ceil(5*sqrt(n))"
+        rows.append((f.metadata["section"], f.name, v))
+    out, last = [], None
+    for section, name, value in rows:
+        out.append(_row((section if section != last else "", name, value)))
+        last = section
+    return out
+
+
+def _fitted_rows(model):
+    """Table rows of the fitted values and the two-stage bookkeeping."""
+    cfg, diag = model.config, model.diagnostics_ or {}
+
+    def num(v):
+        return "%.6g" % v if v is not None else "n/a"
+
+    def how(learned):
+        return "fitted" if learned else "fixed"
+
+    rows = [
+        ("mutation_rate (%s)" % how(cfg.learn_mutation_rate), num(model.mutation_rate_)),
+        ("dimension", model.dimension_ if model.dimension_ is not None else "n/a"),
+        ("heritable_eps (%s)" % how(cfg.learn_heritable_eps), num(model.heritable_eps_)),
+        ("stochastic_delta (%s)" % how(cfg.learn_stochastic_delta), num(model.stochastic_delta_)),
+        ("stochastic_delta per site (min..max)",
+         "%.6g..%.6g (S=%d)" % (min(model.stochastic_delta_sites_), max(model.stochastic_delta_sites_),
+                                len(model.stochastic_delta_sites_))
+         if model.stochastic_delta_sites_ else "n/a"),
+        ("stochastic_delta per cassette",
+         ", ".join("%.4g" % v for v in model.stochastic_delta_cassettes_)
+         if model.stochastic_delta_cassettes_ else "n/a"),
+        ("n_iter", model.n_iter_),
+        ("converged", model.converged_),
+        ("final loss", num(model.history_["loss"][-1]) if (model.history_ or {}).get("loss") else "n/a"),
+    ]
+    if diag.get("stage_transition_step") is not None:
+        rows += [(k, diag.get(k)) for k in
+                 ("stage1_iters", "stage1_converged", "stage_transition_step", "stage2_iters")]
+    if model.learned_allele_prior_ is not None:
+        shape = model.learned_allele_prior_.shape
+        rows.append(("learned_allele_prior",
+                     "(%d states) shared; saved in model.npz" % shape[0] if len(shape) == 1
+                     else "(%d sites, %d states); saved in model.npz" % shape))
+    return [_row(("",) + r) for r in rows]
+
+
+def generate_report(model, path=None):
+    """Writes an HTML run report for a fitted model.
+
+    The report lists hardware, timings, memory, every setting, any warnings
+    from the fit, and the loss curve.
+
+    Args:
+        model: A fitted :class:`~heracles.Heracles`.
+        path: Output ``.html`` file (default ``<outdir>/report.html``).
+
+    Returns:
+        The path written.
+    """
+    from heracles import __version__
+    model._check_fitted()
+    if path is None:
+        path = os.path.join(model.outdir, "report.html")
+    diag = model.diagnostics_ or {}
+    tel = diag.get("telemetry") or {}
+
+    def seconds(t):
+        return "%.1f s" % t if t is not None else "n/a"
+
+    img_b64 = _loss_curve_b64(model)
+    loss_html = ('<img src="data:image/png;base64,%s" style="max-width:100%%;">' % img_b64
+                 if img_b64 else "<p><em>matplotlib not installed; loss curve omitted.</em></p>")
+    warn_list = tel.get("warnings", [])
+    warn_html = ("<ul>%s</ul>" % "".join("<li>%s</li>" % _esc(w) for w in warn_list)
+                 if warn_list else "<p>None.</p>")
+    readout_time_rows = "\n".join(
+        _row(("\u2003Readout (%s)" % rname, seconds(rt)))
+        for rname, rt in (diag.get("readout_times") or {}).items())
+    html = _TEMPLATE.format(
         timestamp=_esc(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         version=_esc(__version__),
-        elapsed=_esc(elapsed_str),
-        init_time=_esc(init_time_str),
-        optimizer_time=_esc(optimizer_time_str),
+        elapsed=_esc(seconds(tel.get("elapsed_s"))),
+        init_time=_esc(seconds(diag.get("init_time"))),
+        optimizer_time=_esc(seconds(diag.get("optimizer_time"))),
         readout_time_rows=readout_time_rows,
-        peak_rss=_esc(peak_str),
+        peak_rss=_esc("%.0f MB" % tel["peak_rss_mb"] if tel.get("peak_rss_mb") else "n/a"),
         n_cells=_esc(tel.get("n_cells", "?")),
         n_sites=_esc(tel.get("n_sites", "?")),
         platform=_esc(tel.get("platform", "unknown")),
@@ -238,12 +220,11 @@ def generate_report(model, path=None):
         python_version=_esc(tel.get("python_version", "unknown")),
         torch_version=_esc(tel.get("torch_version", "unknown")),
         geoopt_version=_esc(tel.get("geoopt_version", "unknown")),
-        param_rows="\n".join(param_rows),
-        fitted_rows="\n".join(fitted_rows),
+        param_rows="\n".join(_param_rows(model)),
+        fitted_rows="\n".join(_fitted_rows(model)),
         warnings=warn_html,
         loss_curve=loss_html,
     )
-
     with open(path, "w") as f:
         f.write(html)
     return path
@@ -272,6 +253,26 @@ def loss_curve_figure(model):
     ax.set_title("Loss curve")
     fig.tight_layout()
     return fig, ax
+
+
+def _dual_axis_plot(plt, series_a, series_b, label_a, label_b, title, colors, path):
+    """Two series against the iteration, each on its own y axis, saved to *path*."""
+    fig, ax1 = plt.subplots(figsize=(6, 2.8))
+    ax1.plot(series_a, lw=1, color=colors[0], label=label_a)
+    ax1.set_xlabel("Iteration")
+    ax1.set_ylabel(label_a, color=colors[0])
+    ax1.tick_params(axis="y", labelcolor=colors[0])
+    ax2 = ax1.twinx()
+    ax2.plot(series_b, lw=1, color=colors[1], alpha=0.7, label=label_b)
+    ax2.set_ylabel(label_b, color=colors[1])
+    ax2.tick_params(axis="y", labelcolor=colors[1])
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
+    ax1.set_title(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def save_plots(model):
@@ -325,52 +326,17 @@ def save_plots(model):
         plt.close(fig)
         saved.append(p)
 
-    # 3. Ultrametric weight + depth CV (dual y-axis)
-    up_w = hist.get("ultrametric_weight")
-    cv = hist.get("depth_cv")
-    if up_w and cv:
-        fig, ax1 = plt.subplots(figsize=(6, 2.8))
-        ax1.plot(up_w, lw=1, color="#2D8E5B", label="UP weight")
-        ax1.set_xlabel("Iteration")
-        ax1.set_ylabel("Ultrametric weight", color="#2D8E5B")
-        ax1.tick_params(axis="y", labelcolor="#2D8E5B")
-        ax2 = ax1.twinx()
-        ax2.plot(cv, lw=1, color="#8E2D5B", alpha=0.7, label="Depth CV")
-        ax2.set_ylabel("Depth CV", color="#8E2D5B")
-        ax2.tick_params(axis="y", labelcolor="#8E2D5B")
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
-        ax1.set_title("Ultrametric penalty")
-        fig.tight_layout()
-        p = os.path.join(model.outdir, "ultrametric.png")
-        fig.savefig(p, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        saved.append(p)
-
-    # 4. Treelike weight + Gromov delta (dual y-axis)
-    tp_w = hist.get("treelike_weight")
-    gd = hist.get("gromov_delta")
-    if tp_w and gd:
-        fig, ax1 = plt.subplots(figsize=(6, 2.8))
-        ax1.plot(tp_w, lw=1, color="#8E2D2D", label="TP weight")
-        ax1.set_xlabel("Iteration")
-        ax1.set_ylabel("Treelike weight", color="#8E2D2D")
-        ax1.tick_params(axis="y", labelcolor="#8E2D2D")
-        ax2 = ax1.twinx()
-        ax2.plot(gd, lw=1, color="#2D5B8E", alpha=0.7,
-                 label="Gromov delta")
-        ax2.set_ylabel("Gromov delta", color="#2D5B8E")
-        ax2.tick_params(axis="y", labelcolor="#2D5B8E")
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
-        ax1.set_title("Treelike penalty")
-        fig.tight_layout()
-        p = os.path.join(model.outdir, "treelike.png")
-        fig.savefig(p, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        saved.append(p)
+    # 3, 4. penalty weight and the quantity it controls, on two y axes
+    for key_w, key_v, name, label_w, label_v, title, colors in (
+            ("ultrametric_weight", "depth_cv", "ultrametric", "UP weight", "Depth CV",
+             "Ultrametric penalty", ("#2D8E5B", "#8E2D5B")),
+            ("treelike_weight", "gromov_delta", "treelike", "TP weight", "Gromov delta",
+             "Treelike penalty", ("#8E2D2D", "#2D5B8E"))):
+        w, v = hist.get(key_w), hist.get(key_v)
+        if w and v:
+            p = os.path.join(model.outdir, name + ".png")
+            _dual_axis_plot(plt, w, v, label_w, label_v, title, colors, p)
+            saved.append(p)
 
     if saved:
         logger.info("saved plots: %s", ", ".join(saved))

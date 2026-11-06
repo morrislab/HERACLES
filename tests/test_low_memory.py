@@ -16,8 +16,8 @@ from heracles.embedding.initialization import (
 )
 from heracles.fit import Heracles, memory_plan
 from heracles.embedding.optimize import iter_dist_rows, pairwise_dists
-from heracles.embedding.sampler import (banded_sampler_reach, build_banded_sampler,
-                                        build_tau_neighbours, build_tau_neighbours_from_cm)
+from heracles.embedding.sampler import (build_quartet_sampler, build_tau_neighbours,
+                                        build_tau_neighbours_from_cm, sampler_reach)
 from heracles.trees.readouts import heracles_upgma, upgma_condensed_height
 from heracles.trees.utils import (
     FOUNDER_LABEL, as_newick, nj_tree, nj_tree_from_rows, robinson_foulds, tree_distances,
@@ -40,13 +40,6 @@ def test_seed_distance_rows_match_full_matrix():
     np.testing.assert_allclose(block, full[rows], rtol=0, atol=0)
 
 
-def test_banded_sampler_reach():
-    assert banded_sampler_reach(16) == 16
-    assert banded_sampler_reach(16, 128) == 128
-    assert banded_sampler_reach(16, 128, 1.0, 4) == 512
-    assert banded_sampler_reach(16, None, 0.5, None) == 64
-
-
 def test_knn_from_cm_matches_full_sort_order():
     st = _toy_states(n=150, S=25, seed=1, missing_frac=0.1)
     est = seed_distances(st)
@@ -62,12 +55,11 @@ def test_knn_from_cm_matches_full_sort_order():
 def test_knn_sampler_draws_same_quartets_as_full_sort():
     st = _toy_states(n=200, S=30, seed=2, missing_frac=0.05)
     est = seed_distances(st)
-    kw = dict(band_kmin=2, band_kmax=8, band_kmax_end=None, band_local_frac=1.0,
-              band_local_mult_max=4)
-    reach = banded_sampler_reach(8, None, 1.0, 4)
-    s_full, _, _ = build_banded_sampler(est, st.shape[0], **kw)
-    s_knn, cfg_knn, _ = build_banded_sampler(None, st.shape[0], sampler_knn=reach,
-                                             character_matrix=st, **kw)
+    kw = dict(sampler_max_k=32)
+    reach = sampler_reach("neighbourhood", 32, 200)
+    s_full, _, _ = build_quartet_sampler(est, st.shape[0], **kw)
+    s_knn, cfg_knn, _ = build_quartet_sampler(None, st.shape[0], sampler_knn=reach,
+                                              character_matrix=st, **kw)
     assert cfg_knn["tau_source"] == "knn_%d" % reach
     g1 = torch.Generator().manual_seed(11); g2 = torch.Generator().manual_seed(11)
     q_full = s_full(200, 500, generator=g1)
@@ -104,8 +96,7 @@ def test_low_memory_fit_end_to_end(tmp_path):
     assert m.dimension_ == 12 and m.coords_.shape == (61, 13)
     assert m.diagnostics_["init_method_used"] == "landmark_mds"
     assert m.diagnostics_["init_meta"]["n_landmarks"] == 61            # n < 500: every cell is a landmark
-    assert m.diagnostics_["sampler_knn"] == min(banded_sampler_reach(
-        m.band_kmax, m.band_kmax_end, m.band_local_frac, m.band_local_mult_max), 59)
+    assert m.diagnostics_["sampler_knn"] == sampler_reach("neighbourhood", m.sampler_max_k, 60) == 59
     assert m._full_dists is None                           # nothing built during the fit
     data = np.load(tmp_path / "lm" / "model.npz", allow_pickle=False)
     assert "full_dists" not in data.files and "coords" in data.files
@@ -231,7 +222,7 @@ def test_grad_accum_matches_full_batch_gradient():
     prior = build_allele_priors(st[1:], prior="global_uniform")
     # root_weight fixed so micro and full batches optimise the same objective
     lf = quartet_loss_fn(st, prior, st.shape[0], est_dists=est, batch_size=100, root_weight=0.3)
-    manifold, _ = lorentz_manifold(6)
+    manifold = lorentz_manifold(6)
     pts0, _ = init_points(manifold, 6, seed_dists=est, init_method="mds")
     g = torch.Generator().manual_seed(5)
     Q = _stratified_quartets(40, 200, generator=g)
@@ -271,12 +262,11 @@ def test_condensed_weighted_hamming_matches_squareform():
 
 def test_upgma_landmark_dists_matches_full_tree_rows():
     from scipy.cluster.hierarchy import linkage, to_tree
-    from heracles.trees.utils import linkage_to_newick
+    from heracles.trees.utils import linkage_to_tree
     st = _toy_states(n=90, S=15, seed=14, missing_frac=0.1)
     labels = ["t%d" % i for i in range(st.shape[0])]
     full = seed_distances(st)
-    nwk = linkage_to_newick(to_tree(linkage(squareform(full, checks=False), "average")), labels)
-    tree = parse_newick(nwk + ";", rooting="force-rooted")
+    tree = linkage_to_tree(to_tree(linkage(squareform(full, checks=False), "average")), labels)
     ref = tree_distances(tree, labels)
     lm = np.array([0, 3, 40, 89])
     block, nwk_lm, _ = tree_init_dists(st, labels, method="upgma", rows=lm)

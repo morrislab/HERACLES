@@ -153,14 +153,14 @@ def test_k1_sequential_matches_cas9_loss():
     est = seed_distances(np.array([ls[l] for l in labels]))
 
     torch.manual_seed(7)
-    cas9_fn = quartet_loss_fn(states, prior, n + 1, est_dists=est,
-                               band_kmin=2, band_kmax=8)
+    from heracles.config import HeraclesConfig
+    cfg8 = HeraclesConfig(sampler_max_k=8)
+    cas9_fn = quartet_loss_fn(states, prior, n + 1, est_dists=est, config=cfg8)
     torch.manual_seed(7)
     seq_fn = sequential_quartet_loss_fn(states, prior, n + 1,
-                                        cassette_size=1, est_dists=est,
-                                        band_kmin=2, band_kmax=8)
+                                        cassette_size=1, est_dists=est, config=cfg8)
 
-    manifold, pdim = lorentz_manifold(8)
+    manifold = lorentz_manifold(8)
     tangent = torch.randn(n + 1, 8, dtype=torch.float64) * 0.1
     zeros = torch.zeros(n + 1, 1, dtype=torch.float64)
     points = manifold.expmap0(torch.cat([zeros, tangent], dim=1))

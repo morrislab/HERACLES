@@ -21,17 +21,17 @@ from heracles.constants import LOG_FLOOR, MASK_LOGIT
 
 
 __all__ = [
-    'observation_weight',
-    'leaf_dropout',
-    'pair_edit_joint',
-    'triple_branch_lengths',
-    'pair_edit_joint_missing',
-    'triple_site_logprob',
-    'leaf_marginal_logprob',
-    'sample_distinct',
-    'gromov_quartet_penalty_from_distances',
-    'gromov_quartet_penalty',
-    'with_learnable_prior',
+    "observation_weight",
+    "leaf_dropout",
+    "pair_edit_joint",
+    "triple_branch_lengths",
+    "pair_edit_joint_missing",
+    "triple_site_logprob",
+    "leaf_marginal_logprob",
+    "sample_distinct",
+    "gromov_quartet_penalty_from_distances",
+    "gromov_quartet_penalty",
+    "with_learnable_prior",
 ]
 
 
@@ -352,6 +352,9 @@ def leaf_marginal_logprob(states, depths, mutation_rate, allele_prior, leaves, h
     return torch.log(P.clamp_min(LOG_FLOOR))
 
 
+#: rejection rounds before distinct rows are drawn as permutations instead
+_DISTINCT_RETRIES = 64
+
 def sample_distinct(n, k, count, generator, device):
     """Sample ``count`` rows of ``k`` distinct indices from 1..n; a ``(count, k)`` long tensor.
 
@@ -359,11 +362,11 @@ def sample_distinct(n, k, count, generator, device):
     gives the same indices on any device, then moves the result to ``device``
     (None keeps it on the CPU). Raises ``ValueError`` if ``k > n``.
     """
+    if k > n:
+        raise ValueError("cannot draw %d distinct indices from 1..%d" % (k, n))
     kw = {"generator": generator} if generator is not None else {}
     t = torch.randint(1, n + 1, (count, k), **kw)
     pairs = torch.combinations(torch.arange(k), r=2)
-    if k > n:
-        raise ValueError("cannot draw %d distinct indices from 1..%d" % (k, n))
 
     def _bad_rows():
         bad = torch.zeros(count, dtype=torch.bool)
@@ -382,9 +385,6 @@ def sample_distinct(n, k, count, generator, device):
         for row in torch.nonzero(_bad_rows()).flatten().tolist():
             t[row] = torch.randperm(n, **kw)[:k] + 1
     return t.to(device) if device is not None else t
-
-
-_DISTINCT_RETRIES = 64
 
 
 def gromov_quartet_penalty_from_distances(d01, d02, d03, d12, d13, d23):
@@ -487,7 +487,8 @@ def with_learnable_prior(core_factory):
     ``get_allele_prior()`` returns the current prior tensor. The public factory
     has the signature ``(states, allele_prior, m, *, learn_allele_prior=False,
     device=None, ...)`` and sets ``loss_fn.allele_prior_param`` (the trainable
-    parameter, or None) so :func:`heracles.embedding.optimize.optimize` trains it.
+    parameter, or None) so :func:`heracles.embedding.optimize.optimize` trains it,
+    and ``loss_fn.get_allele_prior`` (the current prior as probabilities).
     """
     @functools.wraps(core_factory)
     def factory(states, allele_prior, m, **kwargs):
@@ -496,6 +497,7 @@ def with_learnable_prior(core_factory):
             allele_prior, learn_allele_prior, kwargs.get("device"))
         loss_fn = core_factory(states, get_allele_prior, m, **kwargs)
         loss_fn.allele_prior_param = allele_param
+        loss_fn.get_allele_prior = get_allele_prior
         return loss_fn
 
     return factory

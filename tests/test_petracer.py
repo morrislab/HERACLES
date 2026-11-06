@@ -52,7 +52,7 @@ def _loss_at(states, cassette, delta, eps=0.0, seed=0):
     prior = build_allele_priors(states[1:], prior="global_uniform")
     loss_fn = quartet_loss_fn(states, prior, m, est_dists=_hamming(states),
                                batch_size=40, cassette=cassette)
-    manifold, _ = lorentz_manifold(4)
+    manifold = lorentz_manifold(4)
     torch.manual_seed(seed)
     pts, _ = init_points(manifold, 4, seed_dists=_hamming(states), init_method="mds")
     batch = loss_fn.make_eval_batch(torch.Generator().manual_seed(7))

@@ -307,14 +307,6 @@ class EditModel(ABC):
         process, missing = self.components()
         return process.tree_likelihood(char_matrix, missing=missing, **rates)
 
-    def tree_loglik(self, tree, char_matrix, *, root_edge_length=0.0, **rates):
-        """Whole-tree log-likelihood of *char_matrix* on *tree*.
-
-        Rate keywords are those of :meth:`EditProcess.tree_likelihood`.
-        """
-        return self.tree_likelihood(char_matrix, **rates).loglik(
-            tree, root_edge_length=root_edge_length)
-
     def missing_units(self, n_sites):
         return self.missing.units(n_sites)
 

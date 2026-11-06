@@ -15,6 +15,7 @@ import os
 import sys
 
 from heracles.config import add_config_arguments, config_from_args
+from heracles.constants import POLISH_MAX_ROUNDS, POLISH_MIN_GAIN
 from heracles.models import add_model_arguments, model_from_args
 
 
@@ -25,7 +26,7 @@ def _add_fit_args(parser):
                         help="output directory (parent must exist)")
     parser.add_argument("--readouts", nargs="*", default=["nj"],
                         help="trees to build: nj (default), upgma")
-    parser.add_argument("--init-tree", "--init-tree-nwk", dest="init_tree", default=None,
+    parser.add_argument("--init-tree", default=None,
                         help="Newick file of a starting tree; its branch-length distances "
                              "seed the initialisation")
     parser.add_argument("--no-report", action="store_true",
@@ -60,11 +61,11 @@ def _add_polish_args(parser):
                         help="path to a fitted model.npz")
     parser.add_argument("--readout", default="nj",
                         help="which read-out tree to polish (default: nj)")
-    parser.add_argument("--min-gain", type=float, default=None,
+    parser.add_argument("--min-gain", type=float, default=POLISH_MIN_GAIN,
                         help="minimum log-likelihood gain per accepted NNI move "
-                             "(default: the published 1.0)")
-    parser.add_argument("--max-rounds", type=int, default=None,
-                        help="rounds over the candidate branches (default: 3)")
+                             "(default: %s)" % POLISH_MIN_GAIN)
+    parser.add_argument("--max-rounds", type=int, default=POLISH_MAX_ROUNDS,
+                        help="rounds over the candidate branches (default: %s)" % POLISH_MAX_ROUNDS)
     parser.add_argument("--support-threshold", type=float, default=None,
                         help="only try branches whose quartet support is below this "
                              "(default: every branch)")
@@ -75,7 +76,6 @@ def _add_polish_args(parser):
 
 def _cmd_polish(args):
     from heracles import Heracles
-    from heracles.polish.nni import POLISH_MAX_ROUNDS, POLISH_MIN_GAIN
 
     model = Heracles.load(args.model_path)
     if args.outdir:
@@ -83,8 +83,7 @@ def _cmd_polish(args):
         os.makedirs(args.outdir, exist_ok=True)
     res = model.polish(
         args.char_matrix, readout=args.readout,
-        min_gain=POLISH_MIN_GAIN if args.min_gain is None else args.min_gain,
-        max_rounds=POLISH_MAX_ROUNDS if args.max_rounds is None else args.max_rounds,
+        min_gain=args.min_gain, max_rounds=args.max_rounds,
         support_threshold=args.support_threshold, log=lambda s: print(s, file=sys.stderr))
     print(json.dumps({
         "tree": os.path.join(model.outdir, "tree_%s_polished.nwk" % args.readout),

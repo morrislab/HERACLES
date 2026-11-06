@@ -33,27 +33,27 @@ from heracles.models.missing import CassetteDropout
 
 
 __all__ = [
-    'NEGATIVE_INFINITY',
-    'MIN_RATE_TIME',
-    'MIN_PROBABILITY',
-    'MIN_LOG_PROBABILITY',
-    'Cassettes',
-    'validate_cassette_matrix',
-    'cassette_summaries',
-    'with_allele_prior',
-    'shared_prefix_length',
-    'log_transition',
-    'leaf_column',
-    'push_up_branch',
-    'sequential_leaf_marginal_logprob',
-    'sequential_triple_site_logprob',
-    'sequential_quartet_site_logprob_balanced',
-    'sequential_quartet_site_logprob_caterpillar',
-    'sequential_quartet_site_logprob',
-    'cassette_seed_distances',
-    'sequential_quartet_loss_fn',
-    'SequentialProcess',
-    'SequentialModel',
+    "NEGATIVE_INFINITY",
+    "MIN_RATE_TIME",
+    "MIN_PROBABILITY",
+    "MIN_LOG_PROBABILITY",
+    "Cassettes",
+    "validate_cassette_matrix",
+    "cassette_summaries",
+    "with_allele_prior",
+    "shared_prefix_length",
+    "log_transition",
+    "leaf_column",
+    "push_up_branch",
+    "sequential_leaf_marginal_logprob",
+    "sequential_triple_site_logprob",
+    "sequential_quartet_site_logprob_balanced",
+    "sequential_quartet_site_logprob_caterpillar",
+    "sequential_quartet_site_logprob",
+    "cassette_seed_distances",
+    "sequential_quartet_loss_fn",
+    "SequentialProcess",
+    "SequentialModel",
 ]
 
 
@@ -65,6 +65,8 @@ NEGATIVE_INFINITY = -1e30
 # are clamped at zero further up, so t is often exactly 0, and the incomplete
 # gamma has a NaN gradient there.
 MIN_RATE_TIME = 1e-30
+#: floor of the learned initiation ratio's start value
+_RATIO_FLOOR = 1e-4
 # Smallest probability we take a logarithm of.
 MIN_PROBABILITY = 1e-300
 # Floor on any log-probability this module returns, so the sentinel above never
@@ -895,12 +897,7 @@ def cassette_seed_distances(states, cassette_size, on_partial="promote",
 # Loss and entry point
 @with_learnable_prior
 def sequential_quartet_loss_fn(states, get_allele_prior, m, *, est_dists=None,
-                               batch_size=None,
-                               cassette_size=None,
-                               n_quartets=None, root_frac=1.0, root_weight=None,
-                               quartet_sampler="banded",
-                               band_kmin=None, band_kmax=None, band_kmax_end="default",
-                               band_local_frac=None, band_local_mult_max="default",
+                               batch_size=None, cassette_size=None, root_weight=None,
                                rate_model="equal", initiation_ratio=1.0,
                                learn_initiation_ratio=False,
                                on_partial="promote",
@@ -927,16 +924,13 @@ def sequential_quartet_loss_fn(states, get_allele_prior, m, *, est_dists=None,
         on_partial: passed to :func:`validate_cassette_matrix`.
 
     Raises:
-        ValueError: missing ``cassette_size``, fewer than 4 leaves, an unknown
-            sampler, or ``root_weight`` outside [0, 1].
+        ValueError: missing ``cassette_size``, fewer than 4 leaves, or
+            ``root_weight`` outside [0, 1].
     """
     from heracles.embedding.objective import quartet_objective
 
     if cassette_size is None:
         raise ValueError("cassette_size is required for sequential_quartet_loss_fn")
-    if quartet_sampler != "banded":
-        raise ValueError("only the banded quartet sampler is available, got %r"
-                         % (quartet_sampler,))
     state_matrix = torch.as_tensor(states, dtype=torch.long)
     prior = torch.as_tensor(get_allele_prior(), dtype=torch.float64)
     if device is not None:
@@ -945,32 +939,27 @@ def sequential_quartet_loss_fn(states, get_allele_prior, m, *, est_dists=None,
     cassettes, cassette_report = cassette_summaries(
         state_matrix, prior, cassette_size, on_partial=on_partial)
 
-    # A first edit at a different rate from the rest uses the "two_rate"
-    # transitions; the kernels pass `rate` straight to log_transition, so
-    # score() only has to build the per-step rate vector.
+    # A first edit at a different rate from the rest uses the "two_rate" transitions
+    # with a per-position rate vector; otherwise one rate serves every position.
     initiation_ratio = float(initiation_ratio)
-    step_scale = log_init_ratio = None
+    log_init_ratio = None
     if learn_initiation_ratio:
-        ratio_floor = 1e-4
         log_init_ratio = torch.nn.Parameter(torch.log(torch.tensor(
-            max(initiation_ratio, ratio_floor), dtype=torch.float64,
-            device=state_matrix.device)))
+            max(initiation_ratio, _RATIO_FLOOR), dtype=torch.float64, device=state_matrix.device)))
         rate_model = "two_rate"
     elif initiation_ratio != 1.0:
         rate_model = "two_rate"
-        step_scale = torch.ones(cassette_size, dtype=torch.float64, device=state_matrix.device)
-        step_scale[0] = initiation_ratio
+
+    def current_rate(mutation_rate):
+        if log_init_ratio is None and initiation_ratio == 1.0:
+            return mutation_rate
+        scale = torch.ones(cassette_size, dtype=torch.float64, device=mutation_rate.device)
+        scale[0] = torch.exp(log_init_ratio) if log_init_ratio is not None else initiation_ratio
+        return mutation_rate * scale
 
     def score(st, depths, branches, leaves, mutation_rate, heritable_eps, stochastic_delta):
         current_cassettes = with_allele_prior(cassettes, get_allele_prior())
-        if log_init_ratio is not None:
-            scale = torch.ones(cassette_size, dtype=torch.float64, device=mutation_rate.device)
-            scale[0] = torch.exp(log_init_ratio)
-            rate = mutation_rate * scale
-        elif step_scale is not None:
-            rate = mutation_rate * step_scale
-        else:
-            rate = mutation_rate
+        rate = current_rate(mutation_rate)
         log_prob_quartets = sequential_quartet_site_logprob(
             current_cassettes, *branches, rate, heritable_eps=heritable_eps,
             stochastic_delta=stochastic_delta, rate_model=rate_model)
@@ -979,19 +968,10 @@ def sequential_quartet_loss_fn(states, get_allele_prior, m, *, est_dists=None,
             stochastic_delta=stochastic_delta, rate_model=rate_model)
         return log_prob_quartets, log_prob_root
 
-    # one cassette log-probability covers cassette_size sites: dividing by it
-    # puts the loss on the per-site scale of the Cas9 objective
     loss_fn = quartet_objective(
         states, m, score, est_dists=est_dists,
-        batch_size=n_quartets if n_quartets is not None else batch_size,
-        root_frac=root_frac, root_weight=root_weight, config=config, device=device,
-        loss_scale=cassette_size, band_kmin=band_kmin, band_kmax=band_kmax,
-        band_kmax_end=band_kmax_end, band_local_frac=band_local_frac,
-        band_local_mult_max=band_local_mult_max)
-    loss_fn.cassette_size = cassette_size
-    loss_fn.cassette_report = cassette_report
-    loss_fn.rate_model = rate_model
-    loss_fn.initiation_ratio = initiation_ratio
+        batch_size=batch_size, root_weight=root_weight, config=config, device=device,
+        loss_scale=cassette_size)
     loss_fn.initiation_ratio_param = log_init_ratio
     loss_fn.meta.update({"objective": "sequential_quartet", "cassette_size": cassette_size,
                          "cassette_report": cassette_report, "rate_model": rate_model,

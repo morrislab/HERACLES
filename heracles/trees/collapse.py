@@ -12,9 +12,9 @@ from heracles.trees.utils import copy_tree, parse_newick
 
 
 __all__ = [
-    'MISSING_STATE',
-    'reconstruct_lca_states',
-    'sokal_collapse',
+    "MISSING_STATE",
+    "reconstruct_lca_states",
+    "sokal_collapse",
 ]
 
 
@@ -84,5 +84,4 @@ def sokal_collapse(tree, cm, *, missing_state=MISSING_STATE):
                 node.remove_child(child)
                 parent.add_child(child)
             parent.remove_child(node)
-    tree.update_bipartitions(suppress_unifurcations=False)
     return tree

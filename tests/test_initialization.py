@@ -98,7 +98,8 @@ def test_classical_mds_pads_when_dim_exceeds_n():
 def test_init_points_low_memory_runs_at_requested_dimension():
     n, dim = 700, 600
     d = _rank40_dists(n, seed=7)
-    manifold, point_dim = lorentz_manifold(dim)
+    manifold = lorentz_manifold(dim)
+    point_dim = dim + 1
     lm = choose_landmarks(n, default_n_landmarks(dim), seed=0)
     pts, meta = init_points(manifold, dim, seed_dists=d, init_method="mds", landmarks=lm)
     assert pts.shape == (n, point_dim) == (n, dim + 1)
@@ -111,6 +112,6 @@ def test_init_points_low_memory_runs_at_requested_dimension():
 def test_init_points_guard_raises_on_wrong_width(monkeypatch):
     import heracles.embedding.initialization as ini
     monkeypatch.setattr(ini, "classical_mds", lambda d, dim: np.zeros((d.shape[0], 3)))
-    manifold, _ = lorentz_manifold(5)
+    manifold = lorentz_manifold(5)
     with pytest.raises(RuntimeError, match="wrong dimension"):
         init_points(manifold, 5, seed_dists=_rank40_dists(20), init_method="mds")

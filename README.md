@@ -7,11 +7,10 @@ It places every cell as a point in hyperbolic space and moves the points so
 that their distances explain the observed edits under an explicit model of
 CRISPR editing. The objective is a composite likelihood over quartets of
 cells, so it never has to build or score a whole tree during the fit. A tree
-is read off the final distances with neighbour joining and can then be
-polished with likelihood-scored NNI moves.
+is read off the final distances with neighbour joining.
 
 Because the fit is a continuous optimisation, HERACLES scales to very large
-lineages: in the paper it reconstructs 150,000 cells in about six hours on a
+lineages: in the paper it reconstructs 150,000 cells in about four hours on a
 single GPU. The editing model is replaceable, so recorders with cassette-level
 dropout (PETracer) or ordered editing (DNA Typewriter) use the same
 framework.
@@ -96,15 +95,12 @@ model = Heracles(outdir="runs/example")   # the published method
 model.fit("characters.csv")               # a CSV path or a DataFrame
 
 model.newick("nj_collapsed")              # the tree, as Newick
-model.polish("characters.csv")            # optional likelihood NNI polish
-model.newick("nj_polished_collapsed")
 ```
 
 The same from the command line:
 
 ```bash
 heracles fit characters.csv --outdir runs/example
-heracles polish characters.csv --model runs/example/model.npz
 heracles inspect runs/example/model.npz
 ```
 
@@ -112,8 +108,9 @@ heracles inspect runs/example/model.npz
 `device="cuda"` (or `--device cuda`). For tens of thousands of cells, add
 `low_memory=True` (`--low-memory`), which avoids storing an n x n distance
 matrix during the optimisation. Building the final tree is still O(n^2) in
-memory: in the paper (UPGMA read-out), 100,000 cells needed 78 GB of host memory and 150,000
-cells needed 173 GB.
+memory: in the paper (UPGMA read-out), the whole run peaked at about 75 GB of
+host memory for 100,000 cells and about 170 GB for 150,000 cells, almost all
+of it in the read-out.
 
 Trees are rooted at a synthetic unedited founder cell. The `_collapsed` trees
 contract every edge that carries no inferred edit (Camin-Sokal collapse);
@@ -178,7 +175,6 @@ documented in `heracles.models.base`.
 | `config.json` | every setting, the edit model and the fitted rates |
 | `heracles.log` | the run log |
 
-`polish()` adds `tree_nj_polished.nwk` and its collapsed form, and
 `write_report()` adds diagnostic plots and an HTML report. Fitted values are
 attributes ending in `_`, for example `trees_`, `leaf_dists_` (distances
 between cells in the embedding), `heritable_eps_`, `stochastic_delta_`,
@@ -202,15 +198,13 @@ max_iterations=10000, seed=1)`. The ones you are most likely to change:
 
 The method internals (quartet sampler, penalties, learning rate) are in
 `HeraclesConfig.advanced` and listed under "Advanced" in `heracles fit
---help`. The paper describes the method and the reasoning behind these
+--help`. Quartets are drawn from each cell's neighbourhood by default
+(`sampler_strategy="neighbourhood"`); `sampler_strategy="uniform"` draws
+them uniformly instead. The paper describes the method and the reasoning behind these
 settings.
 
 ## Other tools in the package
 
-- `heracles.polish.branch_support`: quartet support for every branch of a tree.
-- `heracles.polish.ancestral.infer_ancestral_states`: posterior character states of
-  every ancestor under the same edit model; `optimize_branch_lengths` refits
-  branch lengths.
 - `heracles.sokal_collapse`: Camin-Sokal collapse of any tree or Newick string.
 - `heracles.robinson_foulds`: Robinson-Foulds distance between two trees or
   Newick strings (`normalized=True` divides by the number of internal edges).

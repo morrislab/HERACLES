@@ -14,22 +14,31 @@ import os
 import time
 
 import numpy as np
+import pandas as pd
+from scipy.optimize import minimize_scalar
 
+from heracles.constants import POLISH_MAX_ROUNDS, POLISH_MIN_GAIN
 from heracles.trees.utils import copy_tree
 from heracles.polish.ancestral import (SCALE_FLOOR, index_tree, optimize_branch_lengths,
                                        prepare_model, pruning_passes)
 
 
+#: above this many leaves the dense OLS branch-length system is skipped
+_DENSE_OLS_MAX_LEAVES = 3000
+#: entries of the pair x edge design matrix held at once when accumulating the OLS normal equations
+_OLS_CHUNK_ENTRIES = 20_000_000
+
+
 __all__ = [
-    'branch_support',
-    'ols_branch_lengths',
-    'RefitResult',
-    'estimate_root_edge',
-    'guided_refit',
-    'POLISH_MIN_GAIN',
-    'POLISH_MAX_ROUNDS',
-    'model_rates',
-    'polish_model',
+    "branch_support",
+    "ols_branch_lengths",
+    "RefitResult",
+    "estimate_root_edge",
+    "guided_refit",
+    "POLISH_MIN_GAIN",
+    "POLISH_MAX_ROUNDS",
+    "model_rates",
+    "polish_model",
 ]
 
 
@@ -135,7 +144,7 @@ def ols_branch_lengths(tree, full_dists, labels):
     n_pairs = iu.shape[0]
     XtX = np.zeros((E, E), dtype=np.float64)
     Xtd = np.zeros(E, dtype=np.float64)
-    chunk = max(1, 20_000_000 // max(E, 1))
+    chunk = max(1, _OLS_CHUNK_ENTRIES // max(E, 1))
     for start in range(0, n_pairs, chunk):
         sl = slice(start, start + chunk)
         Xc = (paths[iu[sl]] != paths[ju[sl]]).astype(np.float64)
@@ -176,6 +185,9 @@ class _State:
         self.model = likelihood
         self.root_edge_length = float(root_edge_length)
         self.refresh()
+        # upper bound per edge for the ML refits: 4x the deepest leaf, at least 1
+        heights = self.tree.calc_node_root_distances(return_leaf_distances_only=True)
+        self.t_max = max(1.0, 4.0 * max(heights or [0.0]))
 
     def refresh(self):
         """Recompute all pruning messages; returns the total log-likelihood."""
@@ -233,8 +245,6 @@ class _State:
         lengths). Returns ``(loglik, {id(node): edge_length})``, or ``None`` if
         the pivot edge is not bifurcating on both ends.
         """
-        from scipy.optimize import minimize_scalar
-
         p = v.parent_node
         if p is None or v.is_leaf():
             return None
@@ -245,7 +255,7 @@ class _State:
         s, kid, keep = sibs[0], kids[which], kids[1 - which]
         model = self.model
         if t_max is None:
-            t_max = self._t_max
+            t_max = self.t_max
         above_p = self._above(p)                     # unchanged by the swap
         F_keep, F_s, F_kid = self._F(keep), self._F(s), self._F(kid)
         lengths = {id(n): max(0.0, float(n.edge_length or 0.0))
@@ -311,13 +321,6 @@ class _State:
                     del self.pr.P[id(p)]
         return ll, lengths
 
-    @property
-    def _t_max(self):
-        if not hasattr(self, "_t_max_cached"):
-            h = self.tree.calc_node_root_distances(return_leaf_distances_only=True)
-            self._t_max_cached = max(1.0, 4.0 * max(h or [0.0]))
-        return self._t_max_cached
-
 
 def _apply_move(tree, v, which, lengths):
     """In place: perform the NNI and set the refit lengths."""
@@ -335,9 +338,7 @@ class RefitResult:
     root_edge_length: float
     loglik_start: float
     loglik_end: float
-    support_start: dict            # clade frozenset -> support
     moves: list                    # accepted moves, in order
-    evaluations: list              # per candidate branch: size, support, best gain
     n_candidates: int              # branches below threshold at the start
     n_evaluated: int               # candidate topologies scored
     n_rounds: int
@@ -353,8 +354,8 @@ class RefitResult:
 #: what the polish reads from an edit process's tree likelihood
 TREE_LIKELIHOOD_API = ("labels", "prior_mass", "emissions", "edge_P", "root_prior", "total")
 
-#: above this many leaves the dense OLS branch-length system is skipped
-_DENSE_OLS_MAX_LEAVES = 3000
+#: a candidate whose fixed-length gain is below this is not refitted
+_PRESCREEN_GAIN = -5.0
 
 
 def estimate_root_edge(tree, full_dists):
@@ -396,10 +397,8 @@ def _seed_lengths(tree, cm, full_dists, labels, *, likelihood, branch_lengths,
 def guided_refit(tree, cm, full_dists, labels, *, rates=None, allele_prior=None,
                  support_threshold=0.9, max_rounds=3, min_gain=1e-6,
                  branch_lengths="ml", root_edge_length=None, n_pairs=200,
-                 seed=0, missing_state=-1, rescore_each_round=False,
-                 seed_sweeps=2, local_sweeps=2, candidate_clades=None,
-                 candidate_frac=None, candidate_rank="support", prescreen_gain=-5.0,
-                 log=None, likelihood=None):
+                 seed=0, missing_state=-1, seed_sweeps=2, local_sweeps=2,
+                 candidate_clades=None, log=None, likelihood=None):
     """NNI hill-climb on low-support branches, accepting likelihood gains.
 
     Each round scores both NNI neighbours of every candidate branch on the current
@@ -425,17 +424,10 @@ def guided_refit(tree, cm, full_dists, labels, *, rates=None, allele_prior=None,
         n_pairs (int): pairs per side for :func:`branch_support`.
         seed (int): random seed for :func:`branch_support`.
         missing_state (int): value in *cm* marking missing data.
-        rescore_each_round (bool): recompute support at the start of each round.
         seed_sweeps (int): ML sweeps for the starting branch lengths.
         local_sweeps (int): ML sweeps over the touched edges per candidate.
         candidate_clades (set of frozenset, optional): explicit candidate leaf sets;
             replaces the threshold.
-        candidate_frac (float, optional): try this fraction of branches instead,
-            ranked by *candidate_rank*.
-        candidate_rank (str): ``"support"`` (lowest first) or ``"gain"`` (largest
-            fixed-length gain first).
-        prescreen_gain (float or None): refit lengths only for candidates whose
-            fixed-length gain exceeds this; None refits every candidate.
         log (callable, optional): receives progress strings.
         likelihood (TreeLikelihood, optional): scorer to use instead of building
             the Cas9 one from *rates* and *allele_prior*.
@@ -463,41 +455,18 @@ def guided_refit(tree, cm, full_dists, labels, *, rates=None, allele_prior=None,
 
     support = {_leafset(n): s for n, s in
                branch_support(cur, full_dists, labels, n_pairs=n_pairs, seed=seed).items()}
-    support_start = dict(support)
-
-    def _select(support):
-        if candidate_clades is not None:
-            return sorted((support.get(c, 1.0), c) for c in candidate_clades)
-        if candidate_frac is not None:
-            k = int(round(candidate_frac * len(support)))
-            if candidate_rank == "gain":
-                by_clade = _node_by_clade(cur)
-                scored = []
-                for c, s in support.items():
-                    v = by_clade.get(c)
-                    outs = [state.evaluate_nni(v, w, n_sweeps=0) for w in (0, 1)] if v is not None else []
-                    g = [o[0] for o in outs if o is not None]
-                    scored.append((max(g) - state.loglik if g else -np.inf, s, c))
-                scored.sort(key=lambda x: -x[0])
-                return [(s, c) for _, s, c in scored[:k]]
-            ranked = sorted((s, c) for c, s in support.items() if not np.isnan(s))
-            return ranked[:k]
-        return sorted((s, c) for c, s in support.items()
+    if candidate_clades is not None:
+        weak = sorted((support.get(c, 1.0), c) for c in candidate_clades)
+    else:
+        weak = sorted((s, c) for c, s in support.items()
                       if not np.isnan(s) and s < support_threshold)
-
-    weak = _select(support)
     n_candidates = len(weak)
     say("seed loglik %.3f, %d/%d branches below support %.2f"
         % (state.loglik, n_candidates, len(support), support_threshold))
 
-    moves, evals, n_eval, rounds = [], [], 0, 0
+    moves, n_eval, rounds = [], 0, 0
     for r in range(max_rounds):
         rounds += 1
-        if rescore_each_round and r > 0:
-            support = {_leafset(n): s for n, s in
-                       branch_support(cur, full_dists, labels, n_pairs=n_pairs,
-                                      seed=seed + r).items()}
-            weak = _select(support)
         by_clade = _node_by_clade(cur)
         proposals = []                                   # (gain, v, which, lengths, s)
         for s, clade in weak:
@@ -506,11 +475,11 @@ def guided_refit(tree, cm, full_dists, labels, *, rates=None, allele_prior=None,
                 continue
             best = None
             for which in (0, 1):
-                if sweeps and prescreen_gain is not None:
+                if sweeps:
                     quick = state.evaluate_nni(v, which, n_sweeps=0)
                     if quick is None:
                         break
-                    if quick[0] - state.loglik <= prescreen_gain:
+                    if quick[0] - state.loglik <= _PRESCREEN_GAIN:
                         n_eval += 1
                         out = quick
                         if best is None or out[0] > best[0]:
@@ -525,8 +494,6 @@ def guided_refit(tree, cm, full_dists, labels, *, rates=None, allele_prior=None,
             if best is None:
                 continue
             gain = best[0] - state.loglik
-            evals.append({"round": r, "clade_size": len(clade),
-                          "support": float(s), "best_gain": float(gain)})
             if gain > min_gain:
                 proposals.append((gain, v, best[1], best[2], s))
 
@@ -584,15 +551,10 @@ def guided_refit(tree, cm, full_dists, labels, *, rates=None, allele_prior=None,
             break
     return RefitResult(tree=cur, root_edge_length=float(root_edge_length),
                        loglik_start=float(loglik_start), loglik_end=float(state.loglik),
-                       support_start=support_start, moves=moves, evaluations=evals,
-                       n_candidates=n_candidates, n_evaluated=n_eval,
+                       moves=moves, n_candidates=n_candidates, n_evaluated=n_eval,
                        n_rounds=rounds, wall_s=time.perf_counter() - t0)
 
 
-#: minimum log-likelihood gain for an accepted NNI move (the published setting)
-POLISH_MIN_GAIN = 1.0
-#: rounds over the candidate branches (the published setting)
-POLISH_MAX_ROUNDS = 3
 
 
 def model_rates(model):
@@ -633,7 +595,6 @@ def polish_model(model, char_matrix, *, readout="nj", min_gain=POLISH_MIN_GAIN,
             from *char_matrix*, or *readout* is not on the model.
         TypeError: if the tree likelihood lacks an attribute the polish reads.
     """
-    import pandas as pd
     if not model.edit_model.supports_polish:
         raise ValueError("the likelihood NNI polish is not available for %s"
                          % type(model.edit_model).__name__)

@@ -20,7 +20,9 @@ import tempfile
 import numpy as np
 
 from heracles.constants import PHYLIP_BYTES_PER_ENTRY
+from heracles.trees.rapidnj import rapidnj_available, run_rapidnj
 from heracles.trees.tree import (
+    Node,
     quote_label,
     TaxonNamespace, Tree,
     native_nj,
@@ -31,21 +33,21 @@ logger = logging.getLogger("heracles")
 
 
 __all__ = [
-    'FOUNDER_LABEL',
-    'quote_label',
-    'as_newick',
-    'write_newick',
-    'parse_newick',
-    'copy_tree',
-    'linkage_to_newick',
-    'root_on_founder',
-    'prune_founder_newick',
-    'tree_distances',
-    'write_phylip',
-    'write_phylip_rows',
-    'nj_tree_from_rows',
-    'nj_tree',
-    'robinson_foulds',
+    "FOUNDER_LABEL",
+    "quote_label",
+    "as_newick",
+    "write_newick",
+    "parse_newick",
+    "copy_tree",
+    "linkage_to_tree",
+    "root_on_founder",
+    "prune_founder_newick",
+    "tree_distances",
+    "write_phylip",
+    "write_phylip_rows",
+    "nj_tree_from_rows",
+    "nj_tree",
+    "robinson_foulds",
 ]
 
 
@@ -56,26 +58,23 @@ FOUNDER_LABEL = "__root__"        # synthetic all-unedited founder cell, always 
 
 def as_newick(tree, *, rooted=True, internal_labels=False):
     """Newick string of *tree*; internal node labels only if ``internal_labels=True``."""
-    return tree.as_string(schema="newick", suppress_rooting=not rooted,
+    return tree.as_string(suppress_rooting=not rooted,
                           suppress_internal_node_labels=not internal_labels).strip()
 
 
 def write_newick(path, tree):
     """Write ``as_newick(tree)`` (terminated with ``;``) to *path*."""
-    nwk = as_newick(tree)
-    if not nwk.endswith(";"):
-        nwk += ";"
     with open(path, "w") as f:
-        f.write(nwk + "\n")
+        f.write(as_newick(tree) + "\n")
 
 
-def parse_newick(data, **kwargs):
+def parse_newick(data, *, taxon_namespace=None, rooting=None):
     """Parse a Newick string into a :class:`~heracles.trees.tree.Tree`.
 
-    Keyword arguments go to :meth:`~heracles.trees.tree.Tree.get` (for example
-    ``taxon_namespace``, ``rooting``). Deep trees are fine (no recursion limit).
+    Options as in :meth:`~heracles.trees.tree.Tree.get`. Deep trees are fine
+    (no recursion limit).
     """
-    return Tree.get(data=data, schema="newick", **kwargs)
+    return Tree.get(data=data, taxon_namespace=taxon_namespace, rooting=rooting)
 
 
 def copy_tree(tree):
@@ -83,28 +82,35 @@ def copy_tree(tree):
     return tree.taxon_namespace_scoped_copy()
 
 
-def linkage_to_newick(node, labels):
-    """Newick (no trailing ``;``) from a scipy ``to_tree`` cluster node.
+def linkage_to_tree(node, labels):
+    """Rooted :class:`~heracles.trees.tree.Tree` from a scipy ``to_tree`` cluster node.
 
-    Branch lengths are parent height minus child height, clamped at 0.
+    Leaf ``i`` gets ``labels[i]``; branch lengths are parent height minus child
+    height, clamped at 0.  Iterative, so deep linkages are fine.
     """
-    done = {}
+    tree = Tree(taxon_namespace=TaxonNamespace(labels))
+    made = {}
     stack = [(node, False)]
     while stack:
         nd, expanded = stack.pop()
         if nd.is_leaf():
-            done[nd.id] = quote_label(labels[nd.id])
+            leaf = Node()
+            leaf.taxon = tree.taxon_namespace.require_taxon(str(labels[nd.id]))
+            made[nd.id] = leaf
         elif not expanded:
             stack.append((nd, True))
             stack.append((nd.right, False))
             stack.append((nd.left, False))
         else:
-            left = done.pop(nd.left.id)
-            right = done.pop(nd.right.id)
-            done[nd.id] = "(%s:%.10g,%s:%.10g)" % (
-                left, max(0.0, nd.dist - nd.left.dist),
-                right, max(0.0, nd.dist - nd.right.dist))
-    return done[node.id]
+            parent = Node()
+            for child in (nd.left, nd.right):
+                sub = made.pop(child.id)
+                sub.edge.length = max(0.0, nd.dist - child.dist)
+                parent.add_child(sub)
+            made[nd.id] = parent
+    tree.seed_node = made[node.id]
+    tree.is_rooted = True
+    return tree
 
 
 # Founder rooting
@@ -114,20 +120,22 @@ def _reroot_on_founder(tree, founder_label):
     founder = tree.find_node_with_taxon_label(founder_label)
     if founder is None:
         return False
-    tree.to_outgroup_position(founder, update_bipartitions=False)
+    tree.to_outgroup_position(founder)
     tree.is_rooted = True
     tree.prune_taxa_with_labels([founder_label], suppress_unifurcations=True)
     return True
 
 
 def root_on_founder(tree, labels, founder_label=FOUNDER_LABEL):
-    """Root *tree* on the founder leaf, prune it, and return a rooted tree over *labels*.
+    """Root *tree* on the founder leaf, prune it, and return it as a rooted tree over *labels*.
 
-    *tree* is modified. *labels* are the leaf labels without the founder.
+    *tree* is modified in place and returned with a fresh taxon namespace in
+    *labels* order (the leaf labels without the founder).
     """
     _reroot_on_founder(tree, founder_label)
-    return parse_newick(as_newick(tree), taxon_namespace=TaxonNamespace(labels),
-                        rooting="force-rooted")
+    tree.use_taxon_namespace(TaxonNamespace(labels))
+    tree.is_rooted = True
+    return tree
 
 
 def prune_founder_newick(tree_nwk, founder_label=FOUNDER_LABEL):
@@ -257,7 +265,6 @@ def nj_tree_from_rows(row_blocks, labels, n, *, timeout=None):
     goes under ``$HERACLES_TMPDIR`` or the system temp dir and is removed afterwards.
     *timeout* is in seconds (None = no limit).
     """
-    from heracles.trees.rapidnj import run_rapidnj
     tns = TaxonNamespace(labels)
     tmpdir = os.environ.get("HERACLES_TMPDIR") or None
     est_gb = n * n * PHYLIP_BYTES_PER_ENTRY / 1024 ** 3
@@ -286,7 +293,6 @@ def nj_tree(dists, labels, *, rapidnj=None, timeout=None):
             Python NJ, None uses RapidNJ when available.
         timeout (float, optional): RapidNJ time limit in seconds.
     """
-    from heracles.trees.rapidnj import rapidnj_available
     if rapidnj is None:
         rapidnj = rapidnj_available()
     if not rapidnj:
@@ -322,6 +328,5 @@ def robinson_foulds(tree1, tree2, *, normalized=False):
     rf = _symmetric_difference(tree1, tree2)
     if not normalized:
         return rf
-    n_internal = (len(tree1.internal_edges(exclude_seed_edge=True))
-                  + len(tree2.internal_edges(exclude_seed_edge=True)))
+    n_internal = len(tree1.internal_edges()) + len(tree2.internal_edges())
     return 0.0 if n_internal == 0 else rf / n_internal

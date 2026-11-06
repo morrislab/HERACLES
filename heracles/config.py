@@ -1,7 +1,7 @@
 """Options of the method, with the published defaults.
 
-:class:`HeraclesConfig` holds the 14 options a user normally sets;
-:class:`AdvancedConfig` (``config.advanced``) holds 19 method internals.
+:class:`HeraclesConfig` holds the options a user normally sets;
+:class:`AdvancedConfig` (``config.advanced``) holds the method internals.
 The estimator, ``config.json``, ``save()``/``load()`` and the command-line
 flags (:func:`add_config_arguments`) are all derived from these fields.
 """
@@ -11,13 +11,15 @@ from dataclasses import dataclass, field, fields
 
 import numpy as np
 
+from heracles.constants import SAMPLER_MAX_K
+
 
 __all__ = [
-    'AUTO_RATE_START',
-    'HeraclesConfig',
-    'AdvancedConfig',
-    'add_config_arguments',
-    'config_from_args',
+    "AUTO_RATE_START",
+    "HeraclesConfig",
+    "AdvancedConfig",
+    "add_config_arguments",
+    "config_from_args",
 ]
 
 
@@ -27,12 +29,8 @@ AUTO_RATE_START = 1e-3
 
 # value parsers: strings from the CLI or config.json -> Python values
 def _dimension(v):
-    if v is None or (isinstance(v, str) and v.lower() in ("none", "default")):
+    if v is None or (isinstance(v, str) and v.lower() == "none"):
         return None
-    if isinstance(v, str) and v.lower() == "auto":
-        raise ValueError(
-            "dimension='auto' is not supported; use None (the default, "
-            "ceil(5*sqrt(n))) or an int")
     d = int(v)
     if d < 2:
         raise ValueError("dimension must be >= 2 or None, got %r" % (v,))
@@ -51,7 +49,7 @@ def _auto_none_or_float(v):
     if isinstance(v, str):
         if v.lower() == "auto":
             return "auto"
-        if v.lower() in ("none", "flat"):
+        if v.lower() == "none":
             return None
         return float(v)
     return float(v)
@@ -126,7 +124,7 @@ class AdvancedConfig:
     """Method internals: rates and priors, quartet sampler, penalties, optimiser, large inputs.
 
     Most users never change them.  Every field can be passed and read flat, e.g.
-    ``Heracles(band_kmax=32)`` or ``config.band_kmax``.
+    ``Heracles(sampler_max_k=256)`` or ``config.sampler_max_k``.
     """
 
     # -- rates and priors
@@ -145,18 +143,15 @@ class AdvancedConfig:
     batch_size: object = _opt(
         None, "quartets per step; 'none' = min(15 n, C(n, 4))", "Advanced: quartet sampler",
         parse=_none_or_int)
-    band_kmin: int = _opt(2, "closest neighbour rank for the second leaf",
-                          "Advanced: quartet sampler")
-    band_kmax: int = _opt(16, "farthest neighbour rank for the second leaf at step 0",
-                          "Advanced: quartet sampler")
-    band_kmax_end: object = _opt(
-        128, "band_kmax after the ramp; 'none' = no ramp", "Advanced: quartet sampler",
-        parse=_none_or_int)
-    band_local_frac: float = _opt(
-        1.0, "share of quartets with a local-outgroup third leaf", "Advanced: quartet sampler")
-    band_local_mult_max: object = _opt(
-        4.0, "rank-multiplier cap for the local outgroup; 'none' = fixed ring",
-        "Advanced: quartet sampler", parse=_none_or_float)
+    sampler_strategy: str = _opt(
+        "neighbourhood", "how quartets are drawn: 'neighbourhood' (a neighbourhood size k log-uniform "
+        "over [3, sampler_max_k], then the three partners uniformly from the first cell's k nearest, "
+        "nearest as its sibling), 'uniform' (four random cells), or the name of a sampler registered "
+        "with heracles.embedding.sampler.register_sampler", "Advanced: quartet sampler")
+    sampler_max_k: object = _opt(
+        SAMPLER_MAX_K, "'neighbourhood' only: cap on the neighbourhood size, and the neighbours kept per cell "
+        "(memory n x sampler_max_k); 'none' = every other cell, a value <= 1 = that fraction of the "
+        "cells, otherwise a cell count", "Advanced: quartet sampler", parse=_none_or_float)
 
     # -- penalties
     ultrametric_penalty: object = _opt(
@@ -197,10 +192,10 @@ class AdvancedConfig:
             raise ValueError("lr_schedule must be 'cosine' or None, got %r" % (self.lr_schedule,))
         if int(self.grad_accum) < 1:
             raise ValueError("grad_accum must be >= 1")
-        if self.band_kmin < 1 or self.band_kmax < self.band_kmin:
-            raise ValueError("need 1 <= band_kmin <= band_kmax")
-        if not 0.0 <= float(self.band_local_frac) <= 1.0:
-            raise ValueError("band_local_frac must be in [0, 1]")
+        from heracles.embedding.sampler import check_strategy
+        check_strategy(self.sampler_strategy)
+        if self.sampler_max_k is not None and float(self.sampler_max_k) <= 0:
+            raise ValueError("sampler_max_k must be positive or None, got %r" % (self.sampler_max_k,))
         return self
 
     def replace(self, **changes):
@@ -275,7 +270,7 @@ class HeraclesConfig:
         self.validate()
 
     def __getattr__(self, name):
-        # flat read access to the advanced options: config.band_kmax
+        # flat read access to the advanced options: config.sampler_max_k
         if name in _ADVANCED and "advanced" in self.__dict__:
             return getattr(self.__dict__["advanced"], name)
         raise AttributeError("%r object has no attribute %r" % (type(self).__name__, name))
@@ -346,17 +341,8 @@ class HeraclesConfig:
         known = set(cls.field_names())
         kw, ignored = {}, []
         for k, v in dict(params).items():
-            if k == "dimension" and isinstance(v, str) and v.lower() == "auto":
-                kw[k] = None          # read as the default dimension
-                ignored.append("dimension=auto (read as the default ceil(5*sqrt(n)))")
-            elif k in known:
+            if k in known:
                 kw[k] = v
-            elif k == "quartet_kwargs" and isinstance(v, dict):
-                for qk, qv in v.items():
-                    if qk in known:
-                        kw[qk] = qv
-                    else:
-                        ignored.append("quartet_kwargs.%s" % qk)
             else:
                 ignored.append(k)
         base = base if base is not None else cls()

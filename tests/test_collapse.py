@@ -78,9 +78,9 @@ def test_founder_leaf_is_pruned():
 def test_input_tree_not_mutated():
     cm = pd.DataFrame({0: [1, 1, 0], 1: [0, 0, 0]}, index=["a", "b", "c"])
     t = _tree("((a:1,b:1)X:1,c:1)root;")
-    before = t.as_string(schema="newick").strip()
+    before = t.as_string().strip()
     sokal_collapse(t, cm)
-    assert t.as_string(schema="newick").strip() == before
+    assert t.as_string().strip() == before
 
 
 def test_collapse_and_rf_are_exported_at_top_level():

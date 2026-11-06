@@ -165,10 +165,10 @@ def test_tree_distances_bit_identical_to_shortest_path(case):
         assert np.array_equal(fast, ref)
 
 
-def test_linkage_to_newick_iterative_matches_recursive():
+def test_linkage_to_tree_iterative_matches_recursive():
     import sys
     from scipy.cluster.hierarchy import linkage, to_tree
-    from heracles.trees.utils import linkage_to_newick, quote_label
+    from heracles.trees.utils import as_newick, linkage_to_tree, parse_newick, quote_label
     labels = ["p%d" % i for i in range(3000)]
     root = to_tree(linkage(np.geomspace(1, 1e6, 3000)[:, None], "single"))
 
@@ -177,14 +177,17 @@ def test_linkage_to_newick_iterative_matches_recursive():
             s = quote_label(labels[nd.id])
         else:
             s = "(%s,%s)" % (emit(nd.left, nd.dist), emit(nd.right, nd.dist))
-        return s if parent_dist is None else "%s:%.10g" % (s, max(0.0, parent_dist - nd.dist))
+        return s if parent_dist is None else "%s:%r" % (s, float(max(0.0, parent_dist - nd.dist)))
 
     limit = sys.getrecursionlimit()
     sys.setrecursionlimit(max(limit, 20000))
     try:
-        assert linkage_to_newick(root, labels) == emit(root)
+        ref = parse_newick(emit(root) + ";", rooting="force-rooted")
     finally:
         sys.setrecursionlimit(limit)
+    tree = linkage_to_tree(root, labels)
+    assert tree.is_rooted and tree.taxon_namespace.labels() == labels
+    assert as_newick(tree) == as_newick(ref)
 
 
 # tree structure and Robinson-Foulds inputs

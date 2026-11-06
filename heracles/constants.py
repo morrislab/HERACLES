@@ -17,12 +17,8 @@ QUARTETS_PER_CELL = 15
 #: default embedding dimension = ceil(DIM_PER_SQRT_N * sqrt(n))
 DIM_PER_SQRT_N = 5
 
-#: steps over which the banded sampler's ``band_kmax`` ramps to ``band_kmax_end``
-SAMPLER_RAMP_STEPS = 2000
-
-#: fixed local-outgroup ring ``[k, LOCAL_RING_MULT * k)`` when
-#: ``band_local_mult_max`` is None
-LOCAL_RING_MULT = 4.0
+#: default neighbourhood cap of the quartet sampler (``sampler_max_k``)
+SAMPLER_MAX_K = 1024
 
 #: bytes per entry of a PHYLIP distance matrix written as text (RapidNJ input)
 PHYLIP_BYTES_PER_ENTRY = 11
@@ -34,10 +30,15 @@ DIST_ROW_CHUNK = 64
 HAMMING_ROW_CHUNK = 128
 
 #: offsets added to the run seed for the sampler, penalty and evaluation RNG
-#: streams so they are independent of each other
+#: streams so they are independent of each other (arbitrary, distinct)
 SEED_OFFSET_SAMPLER = 1
 SEED_OFFSET_PENALTY = 7
 SEED_OFFSET_EVAL = 99
+
+#: likelihood NNI polish (the published settings): minimum log-likelihood gain
+#: for an accepted move, and rounds over the candidate branches
+POLISH_MIN_GAIN = 1.0
+POLISH_MAX_ROUNDS = 3
 
 #: convergence check: every CONVERGENCE_CHECK_EVERY steps (after
 #: ``min_iterations``), stop after CONVERGENCE_PATIENCE consecutive checks

@@ -77,24 +77,27 @@ _BASELINE_DEFAULTS = dict(
     heritable_eps=1e-5, stochastic_delta=0.2,
     learn_heritable_eps=False, learn_stochastic_delta=False,
     ultrametric_penalty=0, ultrametric_target_cv="auto",
-    min_iterations=0, band_kmax_end=None, band_local_frac=0.0,
-    band_local_mult_max=None,
+    min_iterations=0,
 )
 
 CONFIGS = {
-    "quartet_banded_full": dict(
+    "quartet_neighbourhood_full": dict(
         missing_frac=0.15,
         kwargs=dict(learn_heritable_eps=True, learn_stochastic_delta=True,
                     learn_allele_prior=True,
                     ultrametric_penalty="adaptive"),
     ),
-    "quartet_soa": dict(
+    "quartet_neighbourhood_capped": dict(
         missing_frac=0.15,
         kwargs=dict(learn_heritable_eps=True, learn_stochastic_delta=True,
                     learn_allele_prior=True,
-                    ultrametric_penalty="adaptive", min_iterations=0,
-                    band_kmin=2, band_kmax=16, band_kmax_end=128,
-                    band_local_frac=1.0, band_local_mult_max=4),
+                    ultrametric_penalty="adaptive", sampler_max_k=16),
+    ),
+    "quartet_uniform": dict(
+        missing_frac=0.15,
+        kwargs=dict(learn_heritable_eps=True, learn_stochastic_delta=True,
+                    learn_allele_prior=True,
+                    ultrametric_penalty="adaptive", sampler_strategy="uniform"),
     ),
     # alternative objectives / samplers from the paper supplement, run
     # through the loss_factory hook (skipped without the experiments checkout)

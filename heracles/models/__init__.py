@@ -51,7 +51,6 @@ __all__ = [
     "model_option",
     "add_model_arguments",
     "model_from_args",
-    "model_from_legacy_params",
 ]
 
 
@@ -103,25 +102,3 @@ def model_from_args(args):
         parse = own[opt].metadata.get("parse")
         kw[opt] = parse(v) if parse is not None else v
     return cls(**kw)
-
-
-def model_from_legacy_params(params):
-    """Rebuild the edit model from saved parameters.
-
-    Uses the ``edit_model`` entry when present.  Parameter files without one
-    are mapped to a preset from their ``likelihood``, ``dropout_unit``,
-    ``cassette_size`` and ``stochastic_delta_per_site`` keys.
-    """
-    params = params or {}
-    if "edit_model" in params and params["edit_model"]:
-        return get_model(params["edit_model"])
-    separate = bool(params.get("stochastic_delta_per_site", False))
-    if params.get("likelihood") == "sequential":
-        return SequentialModel(cassette_size=params.get("cassette_size"),
-                               initiation_ratio=params.get("initiation_ratio", 1.0),
-                               learn_initiation_ratio=bool(params.get("learn_initiation_ratio",
-                                                                      False)))
-    if params.get("dropout_unit") == "cassette":
-        return PETracerModel(cassette_size=params.get("cassette_size") or 3,
-                             separate_dropout_rates=separate)
-    return Cas9Model(separate_dropout_rates=separate)

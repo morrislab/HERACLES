@@ -284,7 +284,7 @@ def test_edge_loglik_matches_full_recomputation():
     full = []
     for t in (0.1, 0.5, 1.3):
         edge.edge_length = t
-        full.append(infer_ancestral_states(_tree(tree.as_string(schema="newick")),
+        full.append(infer_ancestral_states(_tree(tree.as_string()),
                                            cm, mutation_rate=MU, allele_prior=PRIOR,
                                            heritable_eps=eps, stochastic_delta=delta,
                                            root_edge_length=root_edge).loglik)
@@ -326,7 +326,7 @@ def test_optimize_branch_lengths_monotone_and_recovers():
     for n in tree.preorder_node_iter():
         if n.parent_node is not None:
             n.edge_length = 1.0                        # bad start
-    ll0 = infer_ancestral_states(_tree(tree.as_string(schema="newick")), cm,
+    ll0 = infer_ancestral_states(_tree(tree.as_string()), cm,
                                  mutation_rate=mu, allele_prior=prior,
                                  heritable_eps=eps, stochastic_delta=delta).loglik
     lls = [ll0]

@@ -183,7 +183,7 @@ def test_nni_candidates_count_and_validity():
             assert len(touched) == 5
         assert c1 != c2
     # the input tree is untouched
-    assert tree.as_string(schema="newick") == _tree().as_string(schema="newick")
+    assert tree.as_string() == _tree().as_string()
 
 
 def test_posteriors_false_matches_loglik():
