@@ -58,7 +58,7 @@ def test_knn_sampler_draws_same_quartets_as_full_sort():
     kw = dict(sampler_max_k=32)
     reach = sampler_reach("neighbourhood", 32, 200)
     s_full, _, _ = build_quartet_sampler(est, st.shape[0], **kw)
-    s_knn, cfg_knn, _ = build_quartet_sampler(None, st.shape[0], sampler_knn=reach,
+    s_knn, cfg_knn, _ = build_quartet_sampler(None, st.shape[0], knn_columns=reach,
                                               character_matrix=st, **kw)
     assert cfg_knn["tau_source"] == "knn_%d" % reach
     g1 = torch.Generator().manual_seed(11); g2 = torch.Generator().manual_seed(11)
@@ -106,7 +106,7 @@ def test_low_memory_fit_end_to_end(tmp_path):
     np.testing.assert_allclose(D, pairwise_dists(m.coords_), atol=1e-5)
     assert m.leaf_dists_.shape == (60, 60)
     for r in ("nj", "upgma"):
-        taxa = sorted(t.label for t in m.trees_[r].leaf_nodes() for t in [t.taxon])
+        taxa = sorted(t.label for t in m.trees_[r + "_binary"].leaf_nodes() for t in [t.taxon])
         assert taxa == sorted(cm.index)
     assert m.diagnostics_["telemetry"]["peak_rss_mb"] > 0
     loaded = Heracles.load(tmp_path / "lm" / "model.npz")
@@ -121,7 +121,7 @@ def test_low_memory_upgma_matches_full_path_readout(tmp_path):
                  allele_prior="global_uniform").fit(cm)
     emb_full = {"full_dists": pairwise_dists(m.coords_), "labels": m.labels_}
     t_full = heracles_upgma(emb_full)
-    assert robinson_foulds(t_full, m.trees_["upgma"]) == 0
+    assert robinson_foulds(t_full, m.trees_["upgma_binary"]) == 0
 
 
 @pytest.mark.skipif(not rapidnj_available(), reason="RapidNJ binary not available")
@@ -156,7 +156,7 @@ def test_low_memory_with_rapidnj_init_reproduces_standard_fit(tmp_path):
     assert b.diagnostics_["init_tree_newick"] == a.diagnostics_["init_tree_newick"]
     np.testing.assert_allclose(b.history_["loss"], a.history_["loss"], rtol=1e-9)
     np.testing.assert_allclose(b.coords_, a.coords_, atol=1e-9)
-    assert robinson_foulds(a.trees_["nj"], b.trees_["nj"]) == 0
+    assert robinson_foulds(a.trees_["nj_binary"], b.trees_["nj_binary"]) == 0
 
 
 def test_streamed_seed_distance_rows_match_full_matrix(tmp_path):
@@ -200,15 +200,30 @@ def test_add_readouts_on_loaded_low_memory_model(tmp_path):
                  dimension=6, max_iterations=10, convergence_thresh=None,
                  allele_prior="global_uniform").fit(cm)
     loaded = Heracles.load(tmp_path / "lm" / "model.npz")
-    assert "upgma" not in loaded.trees_
-    new = loaded.add_readouts(["upgma"])
+    assert "upgma_binary" not in loaded.trees_
+    new = loaded.add_readouts(["upgma"], char_matrix=cm)
     assert set(new) == {"upgma"} and loaded._full_dists is None      # streamed from coords
-    assert (tmp_path / "lm" / "tree_upgma.nwk").exists()
+    assert (tmp_path / "lm" / "tree_upgma_binary.nwk").exists()
+    assert (tmp_path / "lm" / "tree_upgma_collapsed.nwk").exists()
     again = Heracles.load(tmp_path / "lm" / "model.npz")
-    assert set(again.trees_) == {"nj", "nj_collapsed", "upgma"}
+    assert set(again.trees_) == {"nj_binary", "nj_collapsed", "upgma_binary", "upgma_collapsed"}
     # same tree as the eager read-out on the materialised matrix
     emb_full = {"full_dists": pairwise_dists(m.coords_), "labels": m.labels_}
     assert robinson_foulds(heracles_upgma(emb_full), new["upgma"]) == 0
+
+
+def test_fit_with_no_readouts_then_add_one(tmp_path):
+    """readouts=[] stops at the embedding (no tree, no collapsed tree); add_readouts fills in."""
+    cm = _cm(n=30, seed=5)
+    m = Heracles(outdir=tmp_path / "none", readouts=[], init_method="mds", dimension=4,
+                 max_iterations=10, convergence_thresh=None, allele_prior="global_uniform").fit(cm)
+    assert m.trees_ == {} and m.coords_ is not None
+    assert not list((tmp_path / "none").glob("tree_*.nwk"))
+    assert set(m.add_readouts(["nj"])) == {"nj"}          # no char_matrix: binary only
+    assert set(m.trees_) == {"nj_binary"}
+    assert (tmp_path / "none" / "tree_nj_binary.nwk").exists()
+    m.add_readouts(["upgma"], char_matrix=cm)
+    assert {"upgma_binary", "upgma_collapsed"} <= set(m.trees_)
 
 
 def test_grad_accum_matches_full_batch_gradient():

@@ -24,7 +24,7 @@ from heracles.embedding.ctmc import (
     _triple_site_logprob_parts,
     gromov_quartet_penalty_from_distances,
 )
-from heracles.embedding.sampler import (_stratified_quartets, build_quartet_sampler,
+from heracles.embedding.sampler import (_stratified_quartets, build_quartet_sampler, sampler_reach,
                                        default_batch_size, n_distinct_quartets)
 
 
@@ -448,13 +448,17 @@ def quartet_objective(states, n_points, score, *, est_dists=None, batch_size=Non
         raise ValueError(f"need at least 4 leaves for the quartet objective, got {n}")
     sampler_kw = {}
     if config is not None:      # the fit's HeraclesConfig supplies the sampler settings
-        sampler_kw = dict(sampler_strategy=config.sampler_strategy,
-                          sampler_max_k=config.sampler_max_k, sampler_knn=config.sampler_knn)
+        sampler_kw = dict(sampler_strategy=config.sampler_strategy, sampler_max_k=config.sampler_max_k)
         if batch_size is None:
             batch_size = config.batch_size
+        if est_dists is None:
+            # no seed matrix (low-memory fits): the sampler ranks neighbours from a
+            # weighted-Hamming k-NN table built from the states, as wide as its reach
+            sampler_kw.update(
+                knn_columns=sampler_reach(config.sampler_strategy, config.sampler_max_k, n),
+                character_matrix=states, device=device)
     if sampler is None:
-        sampler, sampler_config, sampler_stats = build_quartet_sampler(
-            est_dists, n_points, character_matrix=states, device=device, **sampler_kw)
+        sampler, sampler_config, sampler_stats = build_quartet_sampler(est_dists, n_points, **sampler_kw)
         sampler_name = sampler_config["strategy"]
     else:
         sampler_name = getattr(sampler, "__name__", "custom")
@@ -556,7 +560,7 @@ def quartet_loss_fn(states, get_allele_prior, n_points, *, est_dists=None, batch
         sampler: optional callable ``(n_leaves, n_quartets, generator=None,
             device=None)`` that replaces the built-in sampler.
         config: optional ``HeraclesConfig`` that supplies the sampler settings
-            (``sampler_strategy``, ``sampler_max_k``, ``sampler_knn``) and the
+            (``sampler_strategy``, ``sampler_max_k``) and the
             default ``batch_size``.
         cassette: optional :class:`heracles.models.missing.CassetteDropout`; when
             given, the missing-data factors are charged once per cassette instead

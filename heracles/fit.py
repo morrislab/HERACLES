@@ -3,7 +3,8 @@
     from heracles import Heracles
     model = Heracles(outdir="runs/example")     # published defaults
     model.fit(char_matrix)                       # DataFrame or CSV path
-    model.trees_["nj"]                           # tree rooted at the founder
+    model.trees_["nj_binary"]                    # the NJ tree, rooted at the founder
+    model.trees_["nj_collapsed"]                 # the same with edit-free edges contracted
 
 Options are fields of :class:`heracles.config.HeraclesConfig`.
 """
@@ -187,19 +188,16 @@ def embed(char_matrix, *, config=None, edit_model=None, init_dists=None,
     # seed the init, a k-NN table drives the sampler, and the fitted distances
     # are derived from the coordinates on demand.
     low_memory = bool(cfg.low_memory)
-    landmarks = None
+    landmarks = knn_columns = None
     m_points = states_aug.shape[0]
     if low_memory:
         n_lm = min(default_n_landmarks(dimension), m_points)
         landmarks = choose_landmarks(m_points, n_lm, seed=cfg.seed)
         est_aug = None                                  # the sampler works from k-NN tables
-        if cfg.sampler_knn is None:
-            reach = sampler_reach(cfg.sampler_strategy, cfg.sampler_max_k, n_cells)
-            if reach is not None:
-                cfg = cfg.replace(sampler_knn=reach)
-        logger.info("low_memory: %d landmarks seed the init, sampler_knn=%s, "
+        knn_columns = sampler_reach(cfg.sampler_strategy, cfg.sampler_max_k, n_cells)
+        logger.info("low_memory: %d landmarks seed the init, k-NN table of %s columns, "
                     "no (%d x %d) matrix is built during the fit",
-                    n_lm, cfg.sampler_knn, m_points, m_points)
+                    n_lm, knn_columns, m_points, m_points)
     else:
         est_aug = model.seed_distances(states_aug, dtype=dist_dtype)
     for line in memory_plan(n_cells, dimension, low_memory=low_memory,
@@ -268,7 +266,7 @@ def embed(char_matrix, *, config=None, edit_model=None, init_dists=None,
                 states_aug=states_aug,
                 allele_prior=meta.get("learned_allele_prior", prior_array),
                 device=str(device), dist_dtype=dist_dtype,
-                low_memory=low_memory, sampler_knn=cfg.sampler_knn, edit_model=model)
+                low_memory=low_memory, sampler_knn=knn_columns, edit_model=model)
 
 
 def memory_plan(n_cells, dimension, *, low_memory=False, dist_dtype=np.float64,
@@ -433,11 +431,11 @@ class Heracles:
     def fit(self, char_matrix, cell_dropout=None):
         """Fits the embedding, builds the read-out trees and saves the model.
 
-        Writes ``model.npz``, ``tree_<readout>.nwk``, ``config.json`` and
-        ``heracles.log`` into ``outdir``, and returns self.  The first read-out
-        is also written with edit-free edges contracted, as
-        ``tree_<readout>_collapsed.nwk`` (see :meth:`newick`).  Warns if the fit did
-        not converge within ``max_iterations``.
+        Writes ``model.npz``, ``config.json``, ``heracles.log`` and two trees per
+        read-out into ``outdir``, and returns self: ``tree_<readout>_binary.nwk``
+        (the read-out as built) and ``tree_<readout>_collapsed.nwk`` (edit-free
+        edges contracted, see :meth:`newick`).  Warns if the fit did not converge
+        within ``max_iterations``.
 
         Args:
             char_matrix: Cells x sites DataFrame, or a CSV path.
@@ -561,7 +559,7 @@ class Heracles:
             "init_method_used": init_meta.get("init_method_used"),
             "init_tree_newick": init_meta.pop("init_tree_newick", None),
             "init_meta": init_meta,
-            "sampler_knn": emb.get("sampler_knn"),     # k actually used (low_memory sets a default)
+            "sampler_knn": emb.get("sampler_knn"),     # low-memory k-NN table width, else None
         }
         self.diagnostics_.update({k: meta.get(k) for k in (
             "stage1_iters", "stage1_converged", "stage_transition_step", "stage2_iters",
@@ -569,14 +567,18 @@ class Heracles:
             "ultrametric_init_cv")})
 
     def _build_readouts(self, emb, char_matrix):
-        """Builds every read-out tree and the collapsed form of the first one."""
+        """Builds every read-out tree, ``trees_[<r>_binary]``, and its collapsed form.
+
+        With ``readouts=[]`` the fit stops at the embedding; trees can be added
+        later with :meth:`add_readouts`.
+        """
         times = self.diagnostics_["readout_times"]
         for r in self.readouts:
             t_ro = time.perf_counter()
-            self.trees_[r] = READOUTS[r](emb)
+            self.trees_[r + "_binary"] = READOUTS[r](emb)
             times[r] = time.perf_counter() - t_ro
             logger.info("readout %s: %.2fs", r, times[r])
-        self._add_collapsed(self.readouts[0], char_matrix)
+            self._add_collapsed(r, char_matrix)
 
     def _telemetry(self, emb, commit, start_time, elapsed, peak_mb, peak_gpu_mb, warnings_seen):
         """The run record kept in ``diagnostics_["telemetry"]``: timings, memory, platform."""
@@ -611,15 +613,17 @@ class Heracles:
     def polish(self, char_matrix, readout="nj", *, write=True, **kwargs):
         """Improves a read-out tree with likelihood NNI moves (:mod:`heracles.polish.nni`).
 
-        Stores the result as ``trees_[readout + "_polished"]``, and its collapsed
-        form as ``trees_[readout + "_polished_collapsed"]``, and returns the
+        Polishes ``trees_[readout + "_binary"]`` and stores the result as
+        ``trees_[readout + "_polished_binary"]`` with its collapsed form as
+        ``trees_[readout + "_polished_collapsed"]``; returns the
         :class:`~heracles.polish.nni.RefitResult`.  Raises ``ValueError`` if the edit
         model does not support the polish.
 
         Args:
             char_matrix: The matrix the model was fitted on.
-            write: Re-save the model, writing ``tree_<readout>_polished.nwk`` and
-                ``tree_<readout>_polished_collapsed.nwk``.
+            readout: Which read-out to polish (``"nj"`` or ``"upgma"``).
+            write: Re-save the model, writing ``tree_<readout>_polished_binary.nwk``
+                and ``tree_<readout>_polished_collapsed.nwk``.
             **kwargs: Passed to :func:`heracles.polish.nni.polish_model`.
         """
         from heracles.polish.nni import polish_model
@@ -630,7 +634,7 @@ class Heracles:
         res = polish_model(self, char_matrix, readout=readout,
                            log=kwargs.pop("log", logger.info), **kwargs)
         name = readout + "_polished"
-        self.trees_[name] = res.tree
+        self.trees_[name + "_binary"] = res.tree
         self._add_collapsed(name, char_matrix)
         logger.info("polish %s: %d moves in %d rounds, log-lik %.2f -> %.2f (%.1fs)",
                     readout, len(res.moves), res.n_rounds, res.loglik_start,
@@ -639,17 +643,18 @@ class Heracles:
             self.save()
         return res
 
-    def newick(self, readout="nj"):
-        """Returns the Newick string of ``trees_[readout]`` (``KeyError`` if absent).
+    def newick(self, tree="nj_collapsed"):
+        """Returns the Newick string of ``trees_[tree]`` (``KeyError`` if absent).
 
-        Read-out trees are rooted at the founder.  ``"<readout>_collapsed"`` trees
-        have every edge that carries no edit contracted and the founder removed;
-        these are the trees to compare against a reference.
+        Every read-out is kept in two forms: ``"<readout>_binary"``, rooted at
+        the founder as built, and ``"<readout>_collapsed"``, with every edge that
+        carries no edit contracted and the founder removed.  The collapsed trees
+        are the ones to compare against a reference.
         """
         self._check_fitted()
-        if readout not in (self.trees_ or {}):
-            raise KeyError("no %r tree (have %s)" % (readout, sorted(self.trees_ or {})))
-        nwk = as_newick(self.trees_[readout])
+        if tree not in (self.trees_ or {}):
+            raise KeyError("no %r tree (have %s)" % (tree, sorted(self.trees_ or {})))
+        nwk = as_newick(self.trees_[tree])
         return nwk if nwk.endswith(";") else nwk + ";"
 
     def get_params(self):
@@ -710,12 +715,16 @@ class Heracles:
         arrays["_metadata_json"] = np.array(json.dumps(metadata, default=str))
         np.savez_compressed(path, **arrays)
 
-    def add_readouts(self, names, *, device=None, save=True):
+    def add_readouts(self, names, *, char_matrix=None, device=None, save=True):
         """Builds more read-out trees (e.g. ``["upgma"]``) from a fitted or loaded model.
 
         Uses ``full_dists_`` if in memory, otherwise distances from ``coords_`` on
-        *device* (default: the fit's device).  With *save*, re-saves the model,
-        writing ``tree_<name>.nwk``.  Returns a dict of the new trees by name.
+        *device* (default: the fit's device).  Each tree is stored as
+        ``trees_[<name>_binary]`` and, when *char_matrix* (the matrix the model was
+        fitted on) is given, also collapsed as ``trees_[<name>_collapsed]``; without
+        it only the binary form is built and a warning is logged.  With *save*,
+        re-saves the model and writes the new ``tree_*.nwk`` files.  Returns a dict
+        of the new binary trees by read-out name.
         """
         self._check_fitted()
         if isinstance(names, str):
@@ -730,11 +739,16 @@ class Heracles:
         self.diagnostics_ = dict(self.diagnostics_ or {})
         readout_times = self.diagnostics_.setdefault("readout_times", {})
         new = {}
+        if char_matrix is None:
+            logger.warning("add_readouts: no char_matrix given, so the collapsed trees "
+                           "(%s) are not built", ", ".join(r + "_collapsed" for r in names))
         for r in names:
             t0 = time.perf_counter()
-            new[r] = self.trees_[r] = READOUTS[r](emb)
+            new[r] = self.trees_[r + "_binary"] = READOUTS[r](emb)
             readout_times[r] = time.perf_counter() - t0
             logger.info("readout %s (added): %.2fs", r, readout_times[r])
+            if char_matrix is not None:
+                self._add_collapsed(r, char_matrix)
             if r not in self.readouts:
                 self.readouts.append(r)
         if save:
@@ -742,16 +756,16 @@ class Heracles:
         return new
 
     def _add_collapsed(self, name, char_matrix):
-        """Adds ``trees_[name + "_collapsed"]``: ``trees_[name]`` with edit-free edges contracted."""
+        """Adds ``trees_[name + "_collapsed"]``: ``trees_[name + "_binary"]`` with edit-free edges contracted."""
         t0 = time.perf_counter()
         states, labels = load_character_matrix(char_matrix,
                                                missing_state=self.config.missing_state)
         cm = pd.DataFrame(states, index=labels)
-        self.trees_[name + "_collapsed"] = sokal_collapse(self.trees_[name], cm)
+        self.trees_[name + "_collapsed"] = sokal_collapse(self.trees_[name + "_binary"], cm)
         logger.info("collapsed %s: %.2fs", name, time.perf_counter() - t0)
 
     def _write_trees(self, outdir):
-        """``tree_<readout>.nwk`` for every tree."""
+        """``tree_<name>.nwk`` for every tree in ``trees_``."""
         os.makedirs(outdir, exist_ok=True)
         for rname, tree in (self.trees_ or {}).items():
             write_newick(os.path.join(outdir, "tree_%s.nwk" % rname), tree)

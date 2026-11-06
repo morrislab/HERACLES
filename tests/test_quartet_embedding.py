@@ -485,8 +485,8 @@ def test_heracles_quartet_integration(tmp_path):
         outdir=tmp_path)
     model.fit(cm)
     assert model.trees_ is not None
-    assert "nj" in model.trees_
-    assert "upgma" in model.trees_
+    assert "nj_binary" in model.trees_
+    assert "upgma_binary" in model.trees_
 
 
 # 7. Quartet samplers

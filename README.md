@@ -94,7 +94,7 @@ from heracles import Heracles
 model = Heracles(outdir="runs/example")   # the published method
 model.fit("characters.csv")               # a CSV path or a DataFrame
 
-model.newick("nj_collapsed")              # the tree, as Newick
+model.newick()                            # the collapsed NJ tree, as Newick
 ```
 
 The same from the command line:
@@ -112,9 +112,11 @@ memory: in the paper (UPGMA read-out), the whole run peaked at about 75 GB of
 host memory for 100,000 cells and about 170 GB for 150,000 cells, almost all
 of it in the read-out.
 
-Trees are rooted at a synthetic unedited founder cell. The `_collapsed` trees
-contract every edge that carries no inferred edit (Camin-Sokal collapse);
-these are the trees to compare against other methods or a known truth.
+Every read-out tree is kept in two forms. The `_binary` tree is the
+neighbour-joining (or UPGMA) tree as built, rooted at a synthetic unedited
+founder cell. The `_collapsed` tree contracts every edge that carries no
+inferred edit (Camin-Sokal collapse) and drops the founder; these are the
+trees to compare against other methods or a known truth.
 
 ## Tutorials
 
@@ -170,7 +172,7 @@ documented in `heracles.models.base`.
 | File | Contents |
 |---|---|
 | `model.npz` | everything needed to reload the model with `Heracles.load()` |
-| `tree_nj.nwk` | the neighbour-joining tree, rooted at the founder |
+| `tree_nj_binary.nwk` | the neighbour-joining tree, rooted at the founder |
 | `tree_nj_collapsed.nwk` | the same tree with edit-free edges contracted |
 | `config.json` | every setting, the edit model and the fitted rates |
 | `heracles.log` | the run log |

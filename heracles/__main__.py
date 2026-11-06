@@ -70,7 +70,7 @@ def _add_polish_args(parser):
                         help="only try branches whose quartet support is below this "
                              "(default: every branch)")
     parser.add_argument("--outdir", default=None,
-                        help="where to write tree_<readout>_polished.nwk "
+                        help="where to write tree_<readout>_polished_{binary,collapsed}.nwk "
                              "(default: the model's directory)")
 
 
@@ -86,7 +86,9 @@ def _cmd_polish(args):
         min_gain=args.min_gain, max_rounds=args.max_rounds,
         support_threshold=args.support_threshold, log=lambda s: print(s, file=sys.stderr))
     print(json.dumps({
-        "tree": os.path.join(model.outdir, "tree_%s_polished.nwk" % args.readout),
+        "tree": os.path.join(model.outdir, "tree_%s_polished_binary.nwk" % args.readout),
+        "collapsed_tree": os.path.join(model.outdir,
+                                       "tree_%s_polished_collapsed.nwk" % args.readout),
         "moves": len(res.moves), "rounds": res.n_rounds,
         "candidates": res.n_candidates, "evaluated": res.n_evaluated,
         "loglik_start": res.loglik_start, "loglik_end": res.loglik_end,

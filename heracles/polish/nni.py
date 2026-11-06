@@ -579,7 +579,8 @@ def polish_model(model, char_matrix, *, readout="nj", min_gain=POLISH_MIN_GAIN,
     Args:
         model (Heracles): fitted model whose edit model supports the polish.
         char_matrix: the DataFrame (or CSV path) the model was fitted on.
-        readout (str): which tree in ``model.trees_`` to polish.
+        readout (str): which read-out to polish; the tree is
+            ``model.trees_[readout + "_binary"]``.
         min_gain (float): minimum log-likelihood gain to accept a move.
         max_rounds (int): maximum rounds.
         support_threshold (float, optional): default None makes every branch a
@@ -608,7 +609,7 @@ def polish_model(model, char_matrix, *, readout="nj", min_gain=POLISH_MIN_GAIN,
         raise ValueError("character matrix lacks %d of the model's cells (e.g. %r)"
                          % (len(missing), missing[0]))
     cm = cm.loc[labels]
-    if readout not in model.trees_:
+    if readout + "_binary" not in model.trees_:
         raise ValueError("no %r read-out on the model (have %s)"
                          % (readout, sorted(model.trees_)))
     prior = model.learned_allele_prior_
@@ -626,6 +627,6 @@ def polish_model(model, char_matrix, *, readout="nj", min_gain=POLISH_MIN_GAIN,
                         "are listed in heracles.models.base)"
                         % (type(model.edit_model.process).__name__,
                            type(likelihood).__name__, ", ".join(lacking)))
-    return guided_refit(model.trees_[readout], cm, model.full_dists_, labels,
+    return guided_refit(model.trees_[readout + "_binary"], cm, model.full_dists_, labels,
                         likelihood=likelihood, support_threshold=threshold,
                         max_rounds=max_rounds, min_gain=min_gain, log=log, **kwargs)

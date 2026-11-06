@@ -84,7 +84,7 @@ def test_sequential_fit_end_to_end():
         m.fit(cm)
     assert m.leaf_dists_ is not None
     assert m.leaf_dists_.shape == (30, 30)
-    assert "nj" in m.trees_
+    assert "nj_binary" in m.trees_ and "nj_collapsed" in m.trees_
     assert m.n_iter_ == 30
     assert "SequentialModel" in repr(m)
     with pytest.raises(ValueError, match="polish is not available"):
@@ -120,7 +120,7 @@ def test_sequential_save_load_roundtrip():
     assert m2.edit_model == _seq()
     np.testing.assert_array_almost_equal(m.leaf_dists_, m2.leaf_dists_)
     from heracles.trees.utils import as_newick
-    assert as_newick(m2.trees_["nj"]) == as_newick(m.trees_["nj"])
+    assert as_newick(m2.trees_["nj_binary"]) == as_newick(m.trees_["nj_binary"])
 
 
 def test_sequential_get_params():

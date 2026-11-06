@@ -92,7 +92,7 @@ def test_fit_sets_attributes(fitted_model):
 
 def test_fit_trees(fitted_model):
     m = fitted_model
-    assert set(m.trees_.keys()) == {"nj", "upgma", "nj_collapsed"}
+    assert set(m.trees_.keys()) == {"nj_binary", "nj_collapsed", "upgma_binary", "upgma_collapsed"}
     for name, tree in m.trees_.items():
         assert isinstance(tree, Tree), name
         leaves = {l.taxon.label for l in tree.leaf_node_iter()}
@@ -112,30 +112,31 @@ def test_newick(small_cm, tmp_path):
                  max_iterations=10, convergence_thresh=None,
                  allele_prior="global_uniform", init_method="mds",
                  outdir=tmp_path).fit(small_cm)
-    for r in ("nj", "upgma"):
+    for r in ("nj_binary", "nj_collapsed", "upgma_binary", "upgma_collapsed"):
         nwk = m.newick(r)
         assert isinstance(nwk, str) and nwk.endswith(";")
         assert (tmp_path / ("tree_%s.nwk" % r)).read_text().strip() == nwk
-    with pytest.raises(KeyError, match="no 'rapidnj' tree"):
-        m.newick("rapidnj")
+    assert m.newick() == m.newick("nj_collapsed")
+    with pytest.raises(KeyError, match="no 'nj' tree"):
+        m.newick("nj")                       # bare read-out names are not trees
 
 
 def test_collapsed_tree(small_cm, tmp_path):
-    """fit() adds the first read-out with edit-free edges contracted, saved and reloaded."""
+    """fit() adds every read-out with edit-free edges contracted, saved and reloaded."""
     from heracles.trees.collapse import sokal_collapse
     from heracles.trees.utils import as_newick
     m = Heracles(readouts=["nj", "upgma"], dimension=5, max_iterations=10,
                  convergence_thresh=None, allele_prior="global_uniform",
                  init_method="mds", outdir=tmp_path).fit(small_cm)
-    assert "upgma_collapsed" not in m.trees_            # only the first read-out
-    collapsed = m.trees_["nj_collapsed"]
     cm = small_cm.copy()
     cm.index = cm.index.astype(str)
-    assert as_newick(collapsed) == as_newick(sokal_collapse(m.trees_["nj"], cm))
     n_internal = lambda t: sum(1 for v in t.preorder_node_iter() if not v.is_leaf())
-    assert n_internal(collapsed) <= n_internal(m.trees_["nj"])
-    assert ({l.taxon.label for l in collapsed.leaf_node_iter()}
-            == {l.taxon.label for l in m.trees_["nj"].leaf_node_iter()})
+    for r in ("nj", "upgma"):
+        binary, collapsed = m.trees_[r + "_binary"], m.trees_[r + "_collapsed"]
+        assert as_newick(collapsed) == as_newick(sokal_collapse(binary, cm))
+        assert n_internal(collapsed) <= n_internal(binary)
+        assert ({l.taxon.label for l in collapsed.leaf_node_iter()}
+                == {l.taxon.label for l in binary.leaf_node_iter()})
     nwk = m.newick("nj_collapsed")
     assert (tmp_path / "tree_nj_collapsed.nwk").read_text().strip() == nwk
     assert Heracles.load(tmp_path / "model.npz").newick("nj_collapsed") == nwk
@@ -183,7 +184,7 @@ def test_small_fit_nj_only(small_cm, tmp_path):
                  outdir=tmp_path)
     m.fit(small_cm)
     assert m.leaf_dists_ is not None
-    assert "nj" in m.trees_
+    assert "nj_binary" in m.trees_ and "nj_collapsed" in m.trees_
 
 
 # get_params
@@ -234,8 +235,8 @@ def test_save_load_roundtrip(fitted_model):
     assert loaded.stochastic_delta_ == m.stochastic_delta_
     assert set(loaded.trees_.keys()) == set(m.trees_.keys())
     for r in m.readouts:
-        orig_nwk = m.trees_[r].as_string().strip()
-        load_nwk = loaded.trees_[r].as_string().strip()
+        orig_nwk = m.trees_[r + "_binary"].as_string().strip()
+        load_nwk = loaded.trees_[r + "_binary"].as_string().strip()
         assert orig_nwk == load_nwk
 
     assert loaded.diagnostics_["init_time"] == m.diagnostics_["init_time"]
@@ -342,7 +343,7 @@ def test_fit_writes_run_artifacts(small_cm, tmp_path):
 
     # fit() writes exactly these; plots and the report come from write_report()
     assert sorted(p.name for p in out.iterdir()) == [
-        "config.json", "heracles.log", "model.npz", "tree_nj.nwk", "tree_nj_collapsed.nwk"]
+        "config.json", "heracles.log", "model.npz", "tree_nj_binary.nwk", "tree_nj_collapsed.nwk"]
     cfg = json.loads((out / "config.json").read_text())
     assert "git_commit" in cfg          # key present; value may be None
     assert "package_version" in cfg and "timestamp" in cfg
@@ -454,8 +455,8 @@ def test_fit_writes_expected_files(tmp_path, small_cm):
                  convergence_thresh=None, readouts=["nj", "upgma"])
     m.fit(small_cm)
 
-    assert (out / "tree_nj.nwk").exists()
-    assert (out / "tree_upgma.nwk").exists()
+    for name in ("nj_binary", "nj_collapsed", "upgma_binary", "upgma_collapsed"):
+        assert (out / ("tree_%s.nwk" % name)).exists()
     assert (out / "model.npz").exists()
 
     # distances and coordinates are stored in model.npz, not as separate CSVs
@@ -546,9 +547,9 @@ def test_polish_method(fitted_model, small_cm):
     from heracles.polish.nni import RefitResult
     res = fitted_model.polish(small_cm, readout="nj", max_rounds=1)
     assert isinstance(res, RefitResult)
-    assert "nj_polished" in fitted_model.trees_
+    assert "nj_polished_binary" in fitted_model.trees_
     assert res.loglik_end >= res.loglik_start
-    assert os.path.exists(os.path.join(fitted_model.outdir, "tree_nj_polished.nwk"))
+    assert os.path.exists(os.path.join(fitted_model.outdir, "tree_nj_polished_binary.nwk"))
     assert "nj_polished_collapsed" in fitted_model.trees_
     assert os.path.exists(os.path.join(fitted_model.outdir,
                                        "tree_nj_polished_collapsed.nwk"))
@@ -557,7 +558,7 @@ def test_polish_method(fitted_model, small_cm):
 
 
 def test_init_tree_path_and_string(fitted_model, small_cm, tmp_path):
-    nwk = fitted_model.newick("nj")
+    nwk = fitted_model.newick("nj_binary")
     path = tmp_path / "start.nwk"
     path.write_text(nwk + "\n")
     kw = dict(dimension=5, max_iterations=10, convergence_thresh=None,
@@ -636,7 +637,7 @@ def test_nj_falls_back_with_a_warning(small_cm, tmp_path, monkeypatch):
     monkeypatch.setattr(ro, "rapidnj_available", lambda: False)
     with pytest.warns(UserWarning, match="falls back to the pure-Python"):
         slow = Heracles(outdir=tmp_path / "b", **kw).fit(small_cm)
-    assert robinson_foulds(fast.trees_["nj"], slow.trees_["nj"]) == 0
+    assert robinson_foulds(fast.trees_["nj_binary"], slow.trees_["nj_binary"]) == 0
 
 
 def test_unknown_readout_name_is_rejected(tmp_path):

@@ -12,7 +12,7 @@ Samplers are looked up by name in :data:`SAMPLERS`, the value of the
     from heracles.embedding.sampler import register_sampler
 
     @register_sampler("mine")
-    def build_mine(est_dists, n_points, *, sampler_max_k, sampler_knn,
+    def build_mine(est_dists, n_points, *, sampler_max_k, knn_columns,
                    character_matrix, missing_state, device):
         def sampler(n_leaves, n_quartets, generator=None, device=None):
             ...                      # (n_quartets, 4) distinct taxa in 1..n_leaves
@@ -21,8 +21,8 @@ Samplers are looked up by name in :data:`SAMPLERS`, the value of the
 
 and fit with ``Heracles(sampler_strategy="mine")``.  The builder gets the
 ``(n_points, n_points)`` founder-augmented seed distances (``None`` in
-low-memory mode, where ``sampler_knn`` and ``character_matrix`` are set
-instead) and returns the sampler, a dict recording its settings and a dict it
+low-memory mode, where ``knn_columns`` and ``character_matrix`` are set
+instead: build a neighbour table that wide from the states) and returns the sampler, a dict recording its settings and a dict it
 may update with per-batch statistics.  A one-off sampler can also be passed
 directly as ``quartet_loss_fn(..., sampler=callable)``.
 """
@@ -439,9 +439,9 @@ def sampler_reach(sampler_strategy, sampler_max_k, n_leaves):
 
     For the neighbourhood sampler this is the cap ``sampler_max_k`` (a count,
     a fraction <= 1 of ``n_leaves``, or every other leaf when None). A k-NN
-    table (``sampler_knn``) with this many columns yields exactly the same
+    table (``knn_columns``) with this many columns yields exactly the same
     proposals as the full ranking, so low-memory mode uses it as the default
-    ``sampler_knn``. The uniform sampler reads no ranking.
+    ``knn_columns``. The uniform sampler reads no ranking.
     """
     check_strategy(sampler_strategy)
     if sampler_strategy == "uniform":
@@ -506,24 +506,24 @@ def build_uniform_sampler(est_dists, n_points, **_unused):
 
 @register_sampler("neighbourhood")
 def build_neighbourhood_sampler(est_dists, n_points, *, sampler_max_k=SAMPLER_MAX_K,
-                                sampler_knn=None, character_matrix=None, missing_state=-1,
+                                knn_columns=None, character_matrix=None, missing_state=-1,
                                 device=None):
     """``sampler_strategy="neighbourhood"``: :func:`sample_quartets_neighbourhood`.
 
     Keeps each leaf's top-K neighbours with their tau (K = the neighbourhood
-    cap, or ``sampler_knn`` columns in low-memory mode). Tau for the pairs
+    cap, or ``knn_columns`` columns in low-memory mode). Tau for the pairs
     without the first leaf comes from the full tau matrix, or in low-memory mode
     is computed on the fly from the character matrix.
     """
     n = n_points - 1
     k_max = _resolve_max_k(sampler_max_k, n)
     t0 = time.perf_counter()
-    if sampler_knn is not None:
+    if knn_columns is not None:
         if character_matrix is None:
-            raise ValueError("sampler_knn needs character_matrix (the k-NN tables "
+            raise ValueError("knn_columns needs character_matrix (the k-NN tables "
                              "are built from the characters)")
         cm_leaves = np.asarray(character_matrix)[1:]  # drop founder row
-        k_table = min(int(sampler_knn), n - 1)
+        k_table = min(int(knn_columns), n - 1)
         order, tau_knn, d_root = build_tau_neighbours_from_cm(
             cm_leaves, k_table, missing_state=missing_state, device=device)
         tau_fn = _make_tau_fn(cm_leaves, d_root, missing_state=missing_state, device=device)
@@ -566,13 +566,13 @@ def build_neighbourhood_sampler(est_dists, n_points, *, sampler_max_k=SAMPLER_MA
 
 
 def build_quartet_sampler(est_dists, n_points, *, sampler_strategy="neighbourhood",
-                          sampler_max_k=SAMPLER_MAX_K, sampler_knn=None, character_matrix=None,
+                          sampler_max_k=SAMPLER_MAX_K, knn_columns=None, character_matrix=None,
                           missing_state=-1, device=None):
     """Build the quartet sampler named by *sampler_strategy* (see :data:`SAMPLERS`).
 
     Args:
         est_dists: (n_points, n_points) founder-augmented seed distances. May be
-            None when ``sampler_knn`` and ``character_matrix`` are both given,
+            None when ``knn_columns`` and ``character_matrix`` are both given,
             or for the uniform sampler.
         n_points: number of points including the founder.
         sampler_strategy: a key of :data:`SAMPLERS`: "neighbourhood" (default;
@@ -581,11 +581,11 @@ def build_quartet_sampler(est_dists, n_points, *, sampler_strategy="neighbourhoo
         sampler_max_k: "neighbourhood" only: cap on the neighbourhood size
             (None = every other leaf; a value <= 1 is a fraction of the leaves).
             Each leaf keeps only that many neighbours.
-        sampler_knn: if an int k, keep only the top-k neighbours per leaf (O(n k)
-            memory), built from ``character_matrix``, and compute tau on the
-            fly; None works from ``est_dists``.
+        knn_columns: low-memory fits: keep only this many neighbours per leaf
+            (O(n k) memory), ranked from ``character_matrix``, and compute tau on
+            the fly; None works from ``est_dists``.
         character_matrix: (n_points, S) states with the founder at row 0; used
-            for the k-NN table and the on-the-fly tau when ``sampler_knn`` is set.
+            for the k-NN table and the on-the-fly tau when ``knn_columns`` is set.
         missing_state: value marking missing entries.
         device: device for the k-NN table and the on-the-fly tau.
 
@@ -602,5 +602,5 @@ def build_quartet_sampler(est_dists, n_points, *, sampler_strategy="neighbourhoo
     """
     check_strategy(sampler_strategy)
     return SAMPLERS[sampler_strategy](
-        est_dists, n_points, sampler_max_k=sampler_max_k, sampler_knn=sampler_knn,
+        est_dists, n_points, sampler_max_k=sampler_max_k, knn_columns=knn_columns,
         character_matrix=character_matrix, missing_state=missing_state, device=device)

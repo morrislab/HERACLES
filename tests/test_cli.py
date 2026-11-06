@@ -33,8 +33,8 @@ def test_fit_subcommand_runs(tmp_path):
     assert rc == 0
 
     assert os.path.isfile(os.path.join(out, "model.npz"))
-    assert os.path.isfile(os.path.join(out, "tree_nj.nwk"))
-    assert os.path.isfile(os.path.join(out, "tree_upgma.nwk"))
+    for name in ("nj_binary", "nj_collapsed", "upgma_binary", "upgma_collapsed"):
+        assert os.path.isfile(os.path.join(out, "tree_%s.nwk" % name))
     assert os.path.isfile(os.path.join(out, "config.json"))
     assert os.path.isfile(os.path.join(out, "report.html"))
 
@@ -95,7 +95,8 @@ def test_cli_polish(tmp_path):
                  "--max-iterations", "30", "--init-method", "mds", "--no-report"]) == 0
     assert main(["polish", str(csv), "--model", str(out / "model.npz"),
                  "--max-rounds", "1"]) == 0
-    assert (out / "tree_nj_polished.nwk").exists()
+    assert (out / "tree_nj_polished_binary.nwk").exists()
+    assert (out / "tree_nj_polished_collapsed.nwk").exists()
 
 
 def test_cli_input_error_is_one_line(tmp_path, capsys):

@@ -125,7 +125,7 @@ def test_capped_full_and_low_memory_draw_identical_quartets(max_k, knn):
     reach = sampler_reach("neighbourhood", max_k, 300)
     s_full, cfg_full, _ = build_quartet_sampler(est, 301, sampler_max_k=max_k)
     s_low, cfg_low, _ = build_quartet_sampler(None, 301, sampler_max_k=max_k,
-                                              sampler_knn=knn or reach, character_matrix=st)
+                                              knn_columns=knn or reach, character_matrix=st)
     assert cfg_full["tau_source"] == "est_dists"
     assert cfg_low["tau_source"] == "knn_%d" % min(knn or reach, 299)
     g1, g2 = torch.Generator().manual_seed(11), torch.Generator().manual_seed(11)
@@ -203,6 +203,8 @@ def test_reach_and_config_defaults():
     for bad in (dict(sampler_max_k=0), dict(sampler_strategy="banded")):
         with pytest.raises(ValueError):
             HeraclesConfig(**bad)
+    with pytest.raises(TypeError):
+        HeraclesConfig(sampler_knn=16)          # the low-memory table width follows sampler_max_k
     with pytest.raises(TypeError):
         HeraclesConfig(band_kmax=16)
     cfg, ignored = HeraclesConfig.from_params({"sampler_strategy": "uniform", "sampler_max_k": 64})

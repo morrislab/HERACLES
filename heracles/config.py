@@ -178,9 +178,6 @@ class AdvancedConfig:
     # -- large inputs
     grad_accum: int = _opt(
         1, "micro-batches per step (same objective, 1/k GPU memory)", "Advanced: large inputs")
-    sampler_knn: object = _opt(
-        None, "k nearest neighbours kept per leaf; 'none' = full sort",
-        "Advanced: large inputs", parse=_none_or_int)
 
     def __post_init__(self):
         self.validate()
