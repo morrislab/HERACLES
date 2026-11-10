@@ -79,6 +79,9 @@ def _none_or_str(v):
     return str(v)
 
 
+_ALLELE_PRIORS = ("per_site_uniform", "global_uniform", "per_site_event_count", "global_event_count")
+
+
 def _bool(v):
     if isinstance(v, str):
         return v.lower() in ("1", "true", "yes", "on")
@@ -217,9 +220,13 @@ class HeraclesConfig:
     dimension: object = _opt(
         None, "embedding dimension; 'none' = ceil(5*sqrt(n cells))", "Model", parse=_dimension)
     allele_prior: object = _opt(
-        "per_site_uniform", "'per_site_uniform' or 'global_uniform' (Python API: also an array)",
-        "Model", choices=("per_site_uniform", "global_uniform"))
-    learn_allele_prior: bool = _opt(True, "learn the allele weights", "Model", type=bool)
+        "per_site_uniform", "one prior per site or one shared ('global'); '_uniform' starts every "
+        "observed allele equal, '_event_count' weights each allele by how many edit events "
+        "produced it, counted once before the fit (Python API: also an array)",
+        "Model", choices=_ALLELE_PRIORS)
+    learn_allele_prior: bool = _opt(
+        True, "learn the allele weights (event-count priors are counted, never learned)",
+        "Model", type=bool)
 
     # -- missing data
     heritable_eps: object = _opt(
@@ -292,9 +299,9 @@ class HeraclesConfig:
                     "start); pass a positive value or learn_%s=False"
                     % (name, getattr(self, name), name))
         if isinstance(self.allele_prior, str):
-            if self.allele_prior not in ("per_site_uniform", "global_uniform"):
-                raise ValueError("allele_prior must be 'per_site_uniform', "
-                                 "'global_uniform' or an array, got %r" % (self.allele_prior,))
+            if self.allele_prior not in _ALLELE_PRIORS:
+                raise ValueError("allele_prior must be one of %s or an array, got %r"
+                                 % (", ".join(map(repr, _ALLELE_PRIORS)), self.allele_prior))
         else:
             self.allele_prior = np.asarray(self.allele_prior, dtype=np.float64)
         if self.init_method not in ("rapidnj_clamped", "upgma", "mds"):

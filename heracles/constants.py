@@ -20,6 +20,12 @@ DIM_PER_SQRT_N = 5
 #: default neighbourhood cap of the quartet sampler (``sampler_max_k``)
 SAMPLER_MAX_K = 1024
 
+#: nearest neighbours searched when estimating how many cells share one edit event
+EVENT_SIZE_MAX_NEIGHBOURS = 1024
+
+#: count added to every observed allele of an event-count allele prior
+EVENT_COUNT_PSEUDO_COUNT = 0.5
+
 #: bytes per entry of a PHYLIP distance matrix written as text (RapidNJ input)
 PHYLIP_BYTES_PER_ENTRY = 11
 

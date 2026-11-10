@@ -24,16 +24,16 @@ import torch
 import geoopt
 
 from heracles.config import HeraclesConfig
-from heracles.constants import (DIM_PER_SQRT_N,
+from heracles.constants import (DIM_PER_SQRT_N, EVENT_SIZE_MAX_NEIGHBOURS,
                                 PHYLIP_BYTES_PER_ENTRY)
 from heracles.models import get_model, unregistered_parts
 from heracles.embedding.initialization import (
     choose_landmarks, default_n_landmarks, init_points, is_newick_string, lorentz_manifold,
 )
 from heracles.embedding.optimize import optimize, pairwise_dists
-from heracles.embedding.priors import build_allele_priors
+from heracles.embedding.priors import EVENT_COUNT_PRIORS, build_allele_priors
 from heracles.embedding.sampler import (sampler_reach, default_batch_size,
-                                        n_distinct_quartets)
+                                        n_distinct_quartets, nearest_neighbours)
 from heracles.trees.collapse import sokal_collapse
 from heracles.trees.readouts import READOUTS
 from heracles.runinfo import (git_commit, peak_rss_mb, resolve_device, setup_run_logging,
@@ -182,7 +182,6 @@ def embed(char_matrix, *, config=None, edit_model=None, init_dists=None,
         logger.info("cell_dropout table: %d x %d, mean %.4f, range %.3g..%.3g (fixed; "
                     "stochastic_delta is not learned)", *cd.shape, cd.mean(), cd.min(), cd.max())
 
-    prior_array = build_allele_priors(states_aug[1:], prior=cfg.allele_prior)
     dist_dtype = np.float32 if cfg.low_memory else np.float64
     # low-memory mode: no (m, m) array anywhere in the fit. Landmark rows
     # seed the init, a k-NN table drives the sampler, and the fitted distances
@@ -204,6 +203,13 @@ def embed(char_matrix, *, config=None, edit_model=None, init_dists=None,
                             dist_dtype=dist_dtype):
         logger.info("memory plan: %s", line)
 
+    # an event-count prior is counted here, once, from each cell's nearest neighbours; it is not learned
+    count_events = isinstance(cfg.allele_prior, str) and cfg.allele_prior in EVENT_COUNT_PRIORS
+    neighbours = None
+    if count_events:
+        neighbours = nearest_neighbours(states_aug, est_aug, EVENT_SIZE_MAX_NEIGHBOURS, device=device)
+    prior_array = build_allele_priors(states_aug[1:], prior=cfg.allele_prior, neighbours=neighbours)
+
     grad_accum = int(cfg.grad_accum)
     batch_arg = cfg.batch_size
     if grad_accum > 1:
@@ -215,7 +221,7 @@ def embed(char_matrix, *, config=None, edit_model=None, init_dists=None,
                     grad_accum, b_total, grad_accum, batch_arg)
     loss_fn = model.loss_function(states_aug, prior_array, seed_dists=est_aug,
                                   batch_size=batch_arg,
-                                  learn_allele_prior=cfg.learn_allele_prior,
+                                  learn_allele_prior=cfg.learn_allele_prior and not count_events,
                                   config=cfg, device=device)
     t_init = time.perf_counter()
     manifold = lorentz_manifold(dimension)
@@ -248,6 +254,8 @@ def embed(char_matrix, *, config=None, edit_model=None, init_dists=None,
     meta.update(init_time=init_time, init_meta=init_meta,
                 init_method=init_meta.get("init_method_used"))
     meta.update(_loss_fn_meta(loss_fn))
+    if count_events:
+        meta["learned_allele_prior"] = prior_array        # the counted prior is the fit's prior
     if cell_dropout is not None:
         meta["cell_dropout"] = {"shape": list(cd.shape), "mean": float(cd.mean()),
                                 "min": float(cd.min()), "max": float(cd.max())}

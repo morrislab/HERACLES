@@ -193,7 +193,7 @@ max_iterations=10000, seed=1)`. The ones you are most likely to change:
 | `dimension` | `ceil(5 * sqrt(n))` | dimension of the hyperbolic space |
 | `max_iterations` | 5000 | optimisation steps |
 | `heritable_eps`, `stochastic_delta` | 0.001, learned | dropout rates; pass a value with `learn_heritable_eps=False` (or `learn_stochastic_delta=False`) to fix one |
-| `allele_prior` | `"per_site_uniform"` | prior over the alleles at each site |
+| `allele_prior` | `"per_site_uniform"` | prior over the alleles at each site; `"per_site_event_count"` / `"global_event_count"` weight each allele by how many edit events produced it, counted once before the fit instead of learned |
 | `readouts` | `["nj"]` | trees built from the embedding (`"nj"`, `"upgma"`) |
 | `device` | `"cpu"` | `"cpu"`, `"cuda"` or `"auto"` |
 | `low_memory` | `False` | no n x n matrix during the optimisation, for very large inputs |

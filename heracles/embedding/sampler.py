@@ -265,6 +265,24 @@ def build_tau_topk(dists, k, row_chunk=1024):
     return order, tau_knn, tau
 
 
+def nearest_neighbours(states, est_dists, k, *, missing_state=-1, device=None):
+    """Each cell's ``k`` nearest cells, nearest first, in the ranking the neighbourhood sampler uses.
+
+    Args:
+        states: (n+1, S) character matrix, founder at row 0.
+        est_dists: (n+1, n+1) founder-augmented seed distances, or ``None`` to
+            rank from the character matrix without building n x n (low-memory mode).
+        k: neighbours per cell (capped at n - 1).
+
+    Returns:
+        np.ndarray: (n, k) 0-based cell indices (founder excluded).
+    """
+    if est_dists is None:
+        return build_tau_neighbours_from_cm(np.asarray(states)[1:], k, missing_state=missing_state,
+                                            device=device)[0]
+    return build_tau_topk(est_dists, k)[0]
+
+
 def _build_tau_neighbours_from_cm_numpy(cm, k, missing_state=-1):
     """Numpy version of :func:`build_tau_neighbours_from_cm` (same outputs), one row block at a time."""
     cm = np.asarray(cm)

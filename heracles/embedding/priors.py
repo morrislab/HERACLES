@@ -1,21 +1,142 @@
-"""Allele priors for the edit CTMC and MAP priors on the learned missing-data rates."""
+"""Allele priors for the edit CTMC and MAP priors on the learned missing-data rates.
+
+Event-count priors
+------------------
+The allele prior is the chance that one edit event produces a given allele, so
+it should follow how often each allele *arises*.  An edit that happened early is
+inherited by a whole clade, and anything that tallies alleles per cell counts
+that one event once per descendant.  The event-count priors
+(``"per_site_event_count"``, ``"global_event_count"``) count events instead,
+without a tree:
+
+1. For a cell carrying an allele at a site, its *event size* is the number of
+   cells estimated to have inherited the edit from the same event: the cell
+   itself plus the run of its nearest neighbours that carry the same allele.
+   Neighbours missing at the site are skipped, and the run stops at the first
+   neighbour observed without the allele (:func:`estimate_event_sizes`).
+2. Each carrier adds ``1 / event size``, so the carriers of one event add up to
+   one (:func:`count_edit_events`).
+3. The prior is the events per allele plus a small pseudo-count, normalised
+   over the alleles observed at the site, or over all sites for a global prior.
+"""
 
 import math
 
 import numpy as np
 import torch
 
-from heracles.constants import LOG_FLOOR
+from heracles.constants import EVENT_COUNT_PSEUDO_COUNT, LOG_FLOOR
 
 
 __all__ = [
+    "EVENT_COUNT_PRIORS",
     "build_allele_priors",
+    "count_edit_events",
+    "estimate_event_sizes",
     "resolve_prior",
     "missing_log_prior",
 ]
 
 
-def build_allele_priors(char_matrix, prior, missing_state=-1):
+#: allele priors set from counted edit events; they are counted once, not learned
+EVENT_COUNT_PRIORS = ("per_site_event_count", "global_event_count")
+
+# entries of the (cells, neighbours, sites) comparison held in memory at once
+_EVENT_SIZE_BLOCK = 1 << 25
+
+
+def estimate_event_sizes(char_matrix, neighbours, missing_state=-1):
+    """Estimate, for every edited entry, how many cells inherited that edit from one event.
+
+    Cells that inherited one edit event are close relatives, so they come first
+    in each other's neighbour lists.  The event size of cell ``i`` at site ``j``
+    is one (the cell) plus the number of its nearest neighbours that carry the
+    same allele before the first neighbour observed with something else;
+    neighbours missing at the site are skipped.  A run that fills the whole
+    neighbour list means a clade larger than the list, so the event size is then
+    the number of cells carrying the allele at that site.
+
+    Args:
+        char_matrix: (n, S) integer character matrix (0 unedited, >0 allele).
+        neighbours: (n, k) indices of each cell's nearest cells, nearest first.
+        missing_state: value marking missing entries.
+
+    Returns:
+        np.ndarray: (n, S) int64 event sizes; 0 where the cell is unedited or missing.
+    """
+    states = torch.as_tensor(np.asarray(char_matrix), dtype=torch.int32)
+    neighbours = torch.as_tensor(np.asarray(neighbours), dtype=torch.long)
+    n, n_sites = states.shape
+    k = neighbours.shape[1]
+    edited = (states > 0) & (states != missing_state)
+    carriers = _cells_per_allele(states, edited)                         # (S, A + 1)
+    site = torch.arange(n_sites)
+    rank = torch.arange(k)[None, :, None]
+    sizes = torch.zeros((n, n_sites), dtype=torch.long)
+    block = max(1, _EVENT_SIZE_BLOCK // max(k * n_sites, 1))
+    for start in range(0, n, block):
+        own = states[start:start + block]                                # (b, S)
+        near = states[neighbours[start:start + block]]                   # (b, k, S)
+        same = near == own[:, None, :]
+        breaks_run = ~same & (near != missing_state)
+        run_ends = torch.where(breaks_run.any(dim=1), breaks_run.int().argmax(dim=1),
+                               torch.full_like(own, k).long())
+        run = (same & (rank < run_ends[:, None, :])).sum(dim=1)
+        fills_list = run_ends == k
+        size = torch.where(fills_list, carriers[site, own.clamp(min=0).long()], 1 + run)
+        sizes[start:start + block] = torch.where(edited[start:start + block], size.clamp(min=1), 0)
+    return sizes.numpy()
+
+
+def count_edit_events(char_matrix, neighbours, missing_state=-1):
+    """Count the edit events behind each allele at each site, without a tree.
+
+    Every carrier of an allele adds ``1 / event size``
+    (:func:`estimate_event_sizes`), so the cells that inherited one event add up
+    to one.
+
+    Returns:
+        np.ndarray: (S, A + 1) float64 events per site and allele code, A the
+        largest allele code; column 0 (unedited) is 0.
+    """
+    sizes = torch.as_tensor(estimate_event_sizes(char_matrix, neighbours, missing_state))
+    states = torch.as_tensor(np.asarray(char_matrix), dtype=torch.long)
+    edited = sizes > 0
+    weight = torch.where(edited, 1.0 / sizes.clamp(min=1).double(), 0.0)
+    n_codes = int(states.max()) + 1 if edited.any() else 2
+    events = torch.zeros((states.shape[1], n_codes), dtype=torch.float64)
+    events.scatter_add_(1, torch.where(edited, states, 0).T.contiguous(), weight.T.contiguous())
+    events[:, 0] = 0.0
+    return events.numpy()
+
+
+def _cells_per_allele(states, edited):
+    """(S, A + 1) number of cells carrying each allele code at each site."""
+    n_codes = int(states.max()) + 1 if edited.any() else 2
+    cells = torch.zeros((states.shape[1], n_codes), dtype=torch.long)
+    cells.scatter_add_(1, torch.where(edited, states, 0).long().T.contiguous(), edited.long().T.contiguous())
+    return cells
+
+
+def _event_count_prior(char_matrix, neighbours, missing_state, per_site):
+    """Events per allele plus the pseudo-count, normalised over the observed alleles."""
+    if neighbours is None:
+        raise ValueError(
+            "an event-count allele prior is counted from each cell's nearest neighbours; "
+            "pass neighbours=, or use the prior a fitted model stored "
+            "(Heracles.learned_allele_prior_)")
+    events = count_edit_events(char_matrix, neighbours, missing_state)
+    observed = events > 0
+    if not per_site:
+        events, observed = events.sum(axis=0), observed.any(axis=0)
+    weights = np.where(observed, events + EVENT_COUNT_PSEUDO_COUNT, 0.0)
+    total = weights.sum(axis=-1, keepdims=True)
+    result = np.divide(weights, total, out=np.zeros_like(weights), where=total > 0)
+    result[..., 0] = 1.0
+    return result
+
+
+def build_allele_priors(char_matrix, prior, missing_state=-1, neighbours=None):
     """Build the allele prior: the probability that an edit produces each allele.
 
     Args:
@@ -23,13 +144,19 @@ def build_allele_priors(char_matrix, prior, missing_state=-1):
         prior: ``"global_uniform"`` (1/K for each of the K alleles observed
             anywhere; shape (A + 1,), A the largest allele code),
             ``"per_site_uniform"`` (1/K_j per allele observed at site j; shape
-            (S, A + 1)), or an array of shape (K,) or (S, K) used as given (copied).
-            ``"uniform"`` or any other string raises ``ValueError``.
+            (S, A + 1)), ``"global_event_count"`` or ``"per_site_event_count"``
+            (the same shapes, each allele weighted by how many edit events
+            produced it; see the module docstring), or an array of shape (K,) or
+            (S, K) used as given (copied).  ``"uniform"`` or any other string
+            raises ``ValueError``.
+        missing_state: value marking missing entries.
+        neighbours: (n, k) indices of each cell's nearest cells, nearest first;
+            required by the event-count priors, ignored otherwise.
 
     Returns:
-        float64 prior indexed by allele code, slot 0 (unedited) set to 1.0. The
-        uniform options give unobserved alleles 0; a global prior with no observed
-        edits is ``[1, 1]``.
+        float64 prior indexed by allele code, slot 0 (unedited) set to 1.0.
+        Unobserved alleles get 0; a global prior with no observed edits is
+        ``[1, 1]``.
     """
     if isinstance(prior, str) and prior == "uniform":
         raise ValueError(
@@ -44,6 +171,10 @@ def build_allele_priors(char_matrix, prior, missing_state=-1):
         else:
             result[:, 0] = 1.0
         return result
+
+    if prior in EVENT_COUNT_PRIORS:
+        return _event_count_prior(char_matrix, neighbours, missing_state,
+                                  per_site=prior == "per_site_event_count")
 
     if prior == "per_site_uniform":
         n, S = char_matrix.shape
@@ -62,8 +193,8 @@ def build_allele_priors(char_matrix, prior, missing_state=-1):
 
     if prior != "global_uniform":
         raise ValueError(
-            f"prior must be 'global_uniform', 'per_site_uniform', or a "
-            f"numpy array, got {prior!r}")
+            f"prior must be 'global_uniform', 'per_site_uniform', "
+            f"'global_event_count', 'per_site_event_count' or a numpy array, got {prior!r}")
 
     edited = char_matrix[(char_matrix != 0) & (char_matrix != missing_state)]
     if edited.size == 0:
