@@ -19,7 +19,6 @@ from heracles.embedding.ctmc import (
     observation_weight,
     leaf_dropout,
     pair_edit_joint_missing,
-    leaf_marginal_logprob,
     triple_branch_lengths,
     _triple_site_logprob_parts,
     gromov_quartet_penalty_from_distances,
@@ -415,24 +414,21 @@ def quartet_site_logprob(states, is_balanced,
 
 
 def quartet_objective(states, n_points, score, *, est_dists=None, batch_size=None,
-                      root_frac=1.0, root_weight=None, config=None, sampler=None,
-                      device=None, loss_scale=1.0):
+                      config=None, sampler=None, device=None, loss_scale=1.0):
     """The quartet composite-likelihood loss around a model's scoring function.
 
     Shared by every edit process: each step draws a quartet batch from the
     quartet sampler, computes the founder depths, the six pairwise distances and
     the rooted branch lengths, hands the four-point defect and the depths to the
-    optimiser's penalties, picks the leaves of the root-to-leaf term, and asks
-    *score* for the log probabilities.  The loss is
-    ``-((1 - w) mean(quartets) + w mean(root terms)) / loss_scale``.
+    optimiser's penalties, and asks *score* for the quartets' log probabilities.
+    The loss is ``-mean(quartet log probabilities) / loss_scale``.
 
     Args:
         states: (n_points, S) states, founder at row 0.
         n_points: number of points including the founder.
-        score: ``score(states, depths, branches, leaves, mutation_rate,
-            heritable_eps, stochastic_delta) -> (logP_quartets, logP_root)``
-            where ``branches`` is the tuple from :func:`quartet_branch_lengths`
-            and ``leaves`` the leaf indices of the root-to-leaf term.
+        score: ``score(states, depths, branches, mutation_rate, heritable_eps,
+            stochastic_delta) -> logP_quartets`` where ``branches`` is the tuple
+            from :func:`quartet_branch_lengths`.
         loss_scale: divisor of the loss (e.g. sites per cassette, so a cassette
             log probability is on the per-site scale).
         Other arguments: as in :func:`quartet_loss_fn`.
@@ -441,7 +437,7 @@ def quartet_objective(states, n_points, score, *, est_dists=None, batch_size=Non
         The ``loss_fn`` callable with the attributes the optimiser reads
         (``batch_gromov_penalty``, ``batch_depths``, ``make_eval_batch``) and the
         sampler and batch bookkeeping (``quartet_sampler``, ``n_quartets``,
-        ``n_root_terms``, ``root_weight``, ``meta``).
+        ``meta``).
     """
     n = n_points - 1
     if n < 4:
@@ -469,11 +465,6 @@ def quartet_objective(states, n_points, score, *, est_dists=None, batch_size=Non
         st = st.to(torch.device(device))
     batch_size = int(batch_size) if batch_size is not None else default_batch_size(n)
     batch_size = max(1, min(batch_size, n_distinct_quartets(n)))
-    n_root = max(1, int(round(root_frac * n)))
-    root_term_weight = (n_root / (batch_size + n_root)) if root_weight is None else float(root_weight)
-    if not 0.0 <= root_term_weight <= 1.0:
-        raise ValueError(f"root_weight must be in [0, 1], got {root_term_weight!r}")
-    all_leaves = torch.arange(1, n_points, dtype=torch.long).to(st.device)
 
     def loss_fn(points, manifold, radius, mutation_rate, heritable_eps, stochastic_delta,
                 rng, eval_batch=None):
@@ -503,44 +494,32 @@ def quartet_objective(states, n_points, score, *, est_dists=None, batch_size=Non
         branches = quartet_branch_lengths(
             depths, (d01, d02, d03, d12, d13, d23), quartets,
             quartet_depths=quartet_depths)
-        if n_root >= n:
-            leaves = all_leaves
-        else:
-            perm = torch.randperm(n, generator=rng)[:n_root].to(all_leaves.device)
-            leaves = all_leaves[perm]
-        logP_q, logP_root = score(st, depths, branches, leaves, mutation_rate,
-                                  heritable_eps, stochastic_delta)
-        loss = -((1.0 - root_term_weight) * logP_q.mean()
-                 + root_term_weight * logP_root.mean())
+        logP_q = score(st, depths, branches, mutation_rate, heritable_eps, stochastic_delta)
+        loss = -logP_q.mean()
         if loss_scale != 1.0:
             loss = loss / loss_scale
-        return loss, logP_q.numel() + logP_root.numel()
+        return loss, logP_q.numel()
 
     loss_fn.quartet_sampler = sampler_name
     loss_fn.quartet_sampler_config = sampler_config
     loss_fn.quartet_sampler_stats = sampler_stats
     loss_fn.n_quartets = batch_size
-    loss_fn.n_root_terms = n_root
-    loss_fn.root_weight = root_term_weight
     loss_fn.batch_gromov_penalty = None
     loss_fn.batch_depths = None
     loss_fn.make_eval_batch = lambda generator: _stratified_quartets(
         n, batch_size, generator=generator)
     loss_fn.meta = {"n_quartets": batch_size, "quartet_sampler": sampler_name,
                     "quartet_sampler_config": sampler_config,
-                    "quartet_sampler_stats": sampler_stats,
-                    "n_root_terms": n_root, "root_weight": root_term_weight}
+                    "quartet_sampler_stats": sampler_stats}
     return loss_fn
 
 
 @with_learnable_prior
 def quartet_loss_fn(states, get_allele_prior, n_points, *, est_dists=None, batch_size=None,
-                     root_frac=1.0, root_weight=None,
                      device=None, sampler=None, config=None, cassette=None):
     """Return the quartet composite-likelihood loss used by :func:`heracles.fit.embed`.
 
-    The loss is the negative mean log probability of a batch of quartets, mixed
-    with the root-to-leaf term of :func:`heracles.embedding.ctmc.leaf_marginal_logprob`.
+    The loss is the negative mean log probability of a batch of quartets.
     Batches come from :func:`build_quartet_sampler` built on ``est_dists``,
     unless ``sampler`` is given.
 
@@ -551,9 +530,6 @@ def quartet_loss_fn(states, get_allele_prior, n_points, *, est_dists=None, batch
         est_dists: (n_points, n_points) founder-augmented seed distances for the
             sampler.
         batch_size: quartets per step; default ``min(15 n, C(n, 4))``.
-        root_frac: share of leaves in the root-to-leaf term each step (1 = all).
-        root_weight: weight of that term, in [0, 1]; default
-            ``n_root / (batch_size + n_root)``.
         learn_allele_prior: learn the allele prior (keeping its global or
             per-site shape).
         device: torch device for the states and the loss.
@@ -574,15 +550,14 @@ def quartet_loss_fn(states, get_allele_prior, n_points, *, est_dists=None, batch
         optimiser's penalties) and ``allele_prior_param``.
 
     Raises:
-        ValueError: if there are fewer than 4 leaves or ``root_weight`` is outside
-            [0, 1].
+        ValueError: if there are fewer than 4 leaves.
     """
     if cassette is not None:
         st_device = torch.device(device) if device is not None else torch.device("cpu")
         cassette.to(st_device)
         zero_rate = torch.zeros((), dtype=torch.float64, device=st_device)
 
-    def score(st, depths, branches, leaves, mutation_rate, heritable_eps, stochastic_delta):
+    def score(st, depths, branches, mutation_rate, heritable_eps, stochastic_delta):
         allele_prior = get_allele_prior()
 
         def quartet_logprob(hard_states, mu):
@@ -590,28 +565,16 @@ def quartet_loss_fn(states, get_allele_prior, n_points, *, est_dists=None, batch
                                         heritable_eps=heritable_eps,
                                         stochastic_delta=stochastic_delta)
 
-        def root_logprob(hard_states, mu):
-            return leaf_marginal_logprob(hard_states, depths, mu, allele_prior, leaves,
-                                         heritable_eps=heritable_eps,
-                                         stochastic_delta=stochastic_delta)
-
-        # The same kernels on the missing pattern with no edits give the
-        # missing-data factor alone; charge it once per cassette. The order
-        # (quartet term, its correction, root term, its correction) sets the
-        # gradient accumulation order and hence the round-off.
+        # The same kernel on the missing pattern with no edits gives the
+        # missing-data factor alone; charge it once per cassette.
         logP_q = quartet_logprob(st, mutation_rate)
         if cassette is not None:
             logP_q = cassette.correct(logP_q, quartet_logprob(cassette.pattern_states, zero_rate))
-        logP_root = root_logprob(st, mutation_rate)
-        if cassette is not None:
-            logP_root = cassette.correct(logP_root, root_logprob(cassette.pattern_states,
-                                                                 zero_rate))
-        return logP_q, logP_root
+        return logP_q
 
     loss_fn = quartet_objective(
         states, n_points, score, est_dists=est_dists, batch_size=batch_size,
-        root_frac=root_frac, root_weight=root_weight, config=config, sampler=sampler,
-        device=device)
+        config=config, sampler=sampler, device=device)
     loss_fn.meta["objective"] = "quartet"
     if cassette is not None:
         loss_fn.meta.update(cassette.summary())

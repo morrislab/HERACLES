@@ -87,10 +87,10 @@ def test_custom_process_plugs_in(tmp_path):
             return d
 
         def loss_function(self, states, allele_prior, *, missing, seed_dists, batch_size,
-                          root_weight, learn_allele_prior, config, device):
+                          learn_allele_prior, config, device):
             calls["loss"] = True
             return quartet_loss_fn(states, allele_prior, states.shape[0], est_dists=seed_dists,
-                                   batch_size=batch_size, root_weight=root_weight,
+                                   batch_size=batch_size,
                                    learn_allele_prior=learn_allele_prior, config=config,
                                    device=device)
     try:

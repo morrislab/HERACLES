@@ -23,8 +23,8 @@ set ``name`` and ``supported_missing``, implement ``seed_distances`` and
 ``loss_function``, and register it so ``Heracles.load`` can rebuild it.  Most
 processes only need a scoring function: :func:`heracles.embedding.objective.quartet_objective`
 does the quartet sampling, distances, branch lengths and penalties around it.
-A complete (if crude) example, scoring each quartet's cherry and each leaf's
-distance from the founder by whether sites are edited::
+A complete (if crude) example, scoring each quartet's cherry by whether its
+sites are edited::
 
     from heracles.embedding.initialization import seed_distances
     from heracles.embedding.objective import quartet_objective
@@ -39,23 +39,19 @@ distance from the founder by whether sites are edited::
             return seed_distances(states, dtype=dtype)       # weighted Hamming
 
         def loss_function(self, states, allele_prior, *, missing, seed_dists,
-                          batch_size, root_weight, learn_allele_prior, config, device):
-            def score(st, depths, branches, leaves, mutation_rate, heritable_eps,
-                      stochastic_delta):
+                          batch_size, learn_allele_prior, config, device):
+            def score(st, depths, branches, mutation_rate, heritable_eps, stochastic_delta):
                 is_bal, idx_bal, c1, d1 = branches[0], branches[1], branches[4], branches[5]
                 cherry, v1, v2 = branches[10][:, :2], branches[15], branches[16]
                 pair = torch.where(is_bal[:, None], idx_bal[:, :2], cherry)  # (B, 2)
                 t = torch.where(is_bal, c1 + d1, v1 + v2)                    # (B,)
                 a, b = st[pair[:, 0]] > 0, st[pair[:, 1]] > 0                # (B, S)
                 p_same = torch.exp(-mutation_rate * t)[:, None]
-                logp_q = torch.where(a == b, p_same.log(), (1 - p_same).clamp_min(1e-12).log())
-                p0 = torch.exp(-mutation_rate * depths[leaves])[:, None]
-                logp_root = torch.where(st[leaves] > 0, (1 - p0).clamp_min(1e-12).log(), p0.log())
-                return logp_q, logp_root                                     # (B, S), (L, S)
+                return torch.where(a == b, p_same.log(), (1 - p_same).clamp_min(1e-12).log())  # (B, S)
 
             return quartet_objective(states, states.shape[0], score,
                                      est_dists=seed_dists, batch_size=batch_size,
-                                     root_weight=root_weight, config=config, device=device)
+                                     config=config, device=device)
 
     Heracles(outdir=..., edit_model=CustomModel(ToyProcess(), SiteDropout()))
 
@@ -64,7 +60,7 @@ dropout rates; ``Cas9Process`` in :mod:`heracles.models.cas9` is the reference.)
 
 The score function
 ------------------
-``quartet_objective`` calls ``score(st, depths, branches, leaves, mutation_rate,
+``quartet_objective`` calls ``score(st, depths, branches, mutation_rate,
 heritable_eps, stochastic_delta)`` once per step:
 
 * ``st``: ``(m, S)`` long tensor of states, founder at row 0, ``-1`` = missing.
@@ -73,12 +69,11 @@ heritable_eps, stochastic_delta)`` once per step:
   quartets in the batch, the 18-entry tuple documented in
   :func:`heracles.embedding.objective.quartet_branch_lengths`.  Index tensors in
   it (``branches[1]``, ``[9]``, ``[10]``) are rows of ``st``.
-* ``leaves``: ``(L,)`` rows of ``st`` for the founder-to-leaf terms.
 * the three rates: current values (tensors); ignore the ones you do not use.
 
-It returns ``(logp_quartets, logp_root)``: log probabilities whose first
-dimension is ``B`` and ``L``, usually per site, ``(B, S)`` and ``(L, S)``.  The
-loss is minus their weighted means, so any further dimension is averaged.
+It returns the quartets' log probabilities, first dimension ``B``, usually per
+site, ``(B, S)``.  The loss is minus their mean, so any further dimension is
+averaged.
 
 The loss function
 -----------------
@@ -223,7 +218,7 @@ class EditProcess(ABC):
 
     @abstractmethod
     def loss_function(self, states, allele_prior, *, missing, seed_dists, batch_size,
-                      root_weight, learn_allele_prior, config, device):
+                      learn_allele_prior, config, device):
         """Build the per-step loss callable (contract in the module docstring).
 
         Args:
@@ -231,8 +226,6 @@ class EditProcess(ABC):
             seed_dists: ``(m, m)`` output of :meth:`seed_distances`, or ``None``
                 in low-memory mode.
             batch_size: quartets per step; ``None`` uses the default.
-            root_weight: weight of the root-to-leaf term; ``None`` uses the
-                default (set explicitly when gradient accumulation splits a batch).
         """
 
     def tree_likelihood(self, char_matrix, *, missing, mutation_rate, heritable_eps,

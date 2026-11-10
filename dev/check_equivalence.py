@@ -63,7 +63,7 @@ def _factory_model(factory):
         name: ClassVar[str] = "supplement:" + getattr(factory, "__name__", "factory")
 
         def loss_function(self, states, allele_prior, *, seed_dists, batch_size,
-                          root_weight, learn_allele_prior, config, device):
+                          learn_allele_prior, config, device):
             return factory(states, allele_prior, states.shape[0], est_dists=seed_dists,
                            batch_size=batch_size, learn_allele_prior=learn_allele_prior,
                            device=device, config=config)

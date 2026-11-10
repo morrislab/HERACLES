@@ -235,8 +235,7 @@ def test_grad_accum_matches_full_batch_gradient():
     st = _toy_states(n=40, S=12, K=4, seed=21, missing_frac=0.1)
     est = seed_distances(st)
     prior = build_allele_priors(st[1:], prior="global_uniform")
-    # root_weight fixed so micro and full batches optimise the same objective
-    lf = quartet_loss_fn(st, prior, st.shape[0], est_dists=est, batch_size=100, root_weight=0.3)
+    lf = quartet_loss_fn(st, prior, st.shape[0], est_dists=est, batch_size=100)
     manifold = lorentz_manifold(6)
     pts0, _ = init_points(manifold, 6, seed_dists=est, init_method="mds")
     g = torch.Generator().manual_seed(5)

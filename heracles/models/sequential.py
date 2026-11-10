@@ -645,8 +645,8 @@ def sequential_leaf_marginal_logprob(cassettes, depths, rate, leaf_index,
                                      rate_model="equal"):
     """Log-probability of each leaf's cassettes given its depth below the founder.
 
-    This root-to-leaf term fixes how far each leaf sits from the root, which
-    quartets alone do not.
+    The likelihood of a single founder-to-leaf lineage.  It is not part of the
+    fitting loss.
 
     Args:
         cassettes: the :class:`Cassettes` record.
@@ -897,7 +897,7 @@ def cassette_seed_distances(states, cassette_size, on_partial="promote",
 # Loss and entry point
 @with_learnable_prior
 def sequential_quartet_loss_fn(states, get_allele_prior, m, *, est_dists=None,
-                               batch_size=None, cassette_size=None, root_weight=None,
+                               batch_size=None, cassette_size=None,
                                rate_model="equal", initiation_ratio=1.0,
                                learn_initiation_ratio=False,
                                on_partial="promote",
@@ -924,8 +924,7 @@ def sequential_quartet_loss_fn(states, get_allele_prior, m, *, est_dists=None,
         on_partial: passed to :func:`validate_cassette_matrix`.
 
     Raises:
-        ValueError: missing ``cassette_size``, fewer than 4 leaves, or
-            ``root_weight`` outside [0, 1].
+        ValueError: missing ``cassette_size`` or fewer than 4 leaves.
     """
     from heracles.embedding.objective import quartet_objective
 
@@ -957,21 +956,15 @@ def sequential_quartet_loss_fn(states, get_allele_prior, m, *, est_dists=None,
         scale[0] = torch.exp(log_init_ratio) if log_init_ratio is not None else initiation_ratio
         return mutation_rate * scale
 
-    def score(st, depths, branches, leaves, mutation_rate, heritable_eps, stochastic_delta):
+    def score(st, depths, branches, mutation_rate, heritable_eps, stochastic_delta):
         current_cassettes = with_allele_prior(cassettes, get_allele_prior())
-        rate = current_rate(mutation_rate)
-        log_prob_quartets = sequential_quartet_site_logprob(
-            current_cassettes, *branches, rate, heritable_eps=heritable_eps,
+        return sequential_quartet_site_logprob(
+            current_cassettes, *branches, current_rate(mutation_rate), heritable_eps=heritable_eps,
             stochastic_delta=stochastic_delta, rate_model=rate_model)
-        log_prob_root = sequential_leaf_marginal_logprob(
-            current_cassettes, depths, rate, leaves, heritable_eps=heritable_eps,
-            stochastic_delta=stochastic_delta, rate_model=rate_model)
-        return log_prob_quartets, log_prob_root
 
     loss_fn = quartet_objective(
         states, m, score, est_dists=est_dists,
-        batch_size=batch_size, root_weight=root_weight, config=config, device=device,
-        loss_scale=cassette_size)
+        batch_size=batch_size, config=config, device=device, loss_scale=cassette_size)
     loss_fn.initiation_ratio_param = log_init_ratio
     loss_fn.meta.update({"objective": "sequential_quartet", "cassette_size": cassette_size,
                          "cassette_report": cassette_report, "rate_model": rate_model,
@@ -1027,11 +1020,11 @@ class SequentialProcess(EditProcess):
         return cassette_seed_distances(states, self.cassette_size)
 
     def loss_function(self, states, allele_prior, *, missing, seed_dists, batch_size,
-                      root_weight, learn_allele_prior, config, device):
+                      learn_allele_prior, config, device):
         """The sequential quartet likelihood (:func:`sequential_quartet_loss_fn`)."""
         return sequential_quartet_loss_fn(
             states, allele_prior, states.shape[0], est_dists=seed_dists,
-            batch_size=batch_size, root_weight=root_weight,
+            batch_size=batch_size,
             cassette_size=self.cassette_size, initiation_ratio=self.initiation_ratio,
             learn_initiation_ratio=self.learn_initiation_ratio,
             learn_allele_prior=learn_allele_prior, config=config, device=device)

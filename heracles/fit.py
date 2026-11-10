@@ -205,17 +205,16 @@ def embed(char_matrix, *, config=None, edit_model=None, init_dists=None,
         logger.info("memory plan: %s", line)
 
     grad_accum = int(cfg.grad_accum)
-    batch_arg, root_weight = cfg.batch_size, None
+    batch_arg = cfg.batch_size
     if grad_accum > 1:
         # same objective as one full batch, split into micro-batches
         b_total = int(cfg.batch_size) if cfg.batch_size is not None else default_batch_size(n_cells)
         b_total = max(1, min(b_total, n_distinct_quartets(n_cells)))
         batch_arg = -(-b_total // grad_accum)
-        root_weight = n_cells / (b_total + n_cells)
         logger.info("grad_accum=%d: %d quartets per step as %d micro-batches of %d",
                     grad_accum, b_total, grad_accum, batch_arg)
     loss_fn = model.loss_function(states_aug, prior_array, seed_dists=est_aug,
-                                  batch_size=batch_arg, root_weight=root_weight,
+                                  batch_size=batch_arg,
                                   learn_allele_prior=cfg.learn_allele_prior,
                                   config=cfg, device=device)
     t_init = time.perf_counter()

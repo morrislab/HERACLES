@@ -43,7 +43,7 @@ class Cas9Process(EditProcess):
         return seed_distances(states, dtype=dtype)
 
     def loss_function(self, states, allele_prior, *, missing, seed_dists, batch_size,
-                      root_weight, learn_allele_prior, config, device):
+                      learn_allele_prior, config, device):
         """Quartet loss (:func:`heracles.embedding.objective.quartet_loss_fn`); with :class:`CassetteDropout`
         it adds the :class:`CassetteCorrection` and logs the cassette missingness counts.
         """
@@ -54,7 +54,7 @@ class Cas9Process(EditProcess):
             correction.log_report(logger)
             extras["cassette"] = correction
         return quartet_loss_fn(states, allele_prior, states.shape[0], est_dists=seed_dists,
-                               batch_size=batch_size, root_weight=root_weight,
+                               batch_size=batch_size,
                                learn_allele_prior=learn_allele_prior, config=config,
                                device=device, **extras)
 

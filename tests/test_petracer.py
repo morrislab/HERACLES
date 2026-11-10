@@ -88,12 +88,10 @@ def test_cassette_loss_without_missing_differs_by_constant():
     delta = 0.1
     site_loss, _, _ = _loss_at(states, None, delta)
     cas_loss, loss_fn, _ = _loss_at(states, CassetteCorrection(groups, states), delta)
-    # every (quartet, site) log-term gains back (1 - 1/3) * 4 log(1 - delta) and
-    # every root term (1 - 1/3) * log(1 - delta) (both negative numbers that the
-    # per-site model over-charged); the loss is minus the weighted mean, so
-    # loss_cassette - loss_site = + (1 - 1/3) * mean pattern log-probability
-    w = loss_fn.root_weight
-    expect = (1 - w) * (2 / 3) * 4 * np.log(1 - delta) + w * (2 / 3) * np.log(1 - delta)
+    # every (quartet, site) log-term gains back (1 - 1/3) * 4 log(1 - delta) (a
+    # negative number that the per-site model over-charged); the loss is minus the
+    # mean, so loss_cassette - loss_site = + (1 - 1/3) * mean pattern log-probability
+    expect = (2 / 3) * 4 * np.log(1 - delta)
     assert cas_loss - site_loss == pytest.approx(expect, rel=1e-10)
 
 
@@ -109,9 +107,7 @@ def test_cassette_loss_matches_closed_form_with_missing():
     miss = states < 0
     per_leaf = np.where(miss, np.log(delta), np.log(1 - delta))      # (m, S)
     q_pat = per_leaf[batch.numpy()].sum(axis=1)                       # (B, S)
-    root_pat = per_leaf[1:]                                           # all leaves (root_frac=1)
-    w = loss_fn.root_weight
-    expect = (1 - w) * (2 / 3) * q_pat.mean() + w * (2 / 3) * root_pat.mean()
+    expect = (2 / 3) * q_pat.mean()
     assert cas_loss - site_loss == pytest.approx(expect, rel=1e-10)
 
 

@@ -3,7 +3,7 @@
 Per-site probability kernels for the Cas9 edit CTMC with heritable deletion
 (``heritable_eps``) and stochastic dropout (``stochastic_delta``), evaluated on
 branch lengths read off the embedding: pair joints, the rooted-triple kernel
-(:func:`triple_site_logprob`), the root-to-leaf marginal
+(:func:`triple_site_logprob`), the single-lineage marginal
 (:func:`leaf_marginal_logprob`), the Gromov four-point penalty, a
 distinct-index sampler and the learnable allele-prior decorator
 (:func:`with_learnable_prior`).
@@ -328,9 +328,8 @@ def triple_site_logprob(states, idx, root_u, u_v, v_cherry1, v_cherry2,
 def leaf_marginal_logprob(states, depths, mutation_rate, allele_prior, leaves, heritable_eps=0.0, stochastic_delta=0.0):
     """Per-leaf, per-site log probability of the observed state along the root-to-leaf path.
 
-    Sampled triples and quartets never contain the founder, so this term is
-    what fixes each leaf's absolute depth ``d(o, x)``. With missing data the
-    leaf is observed with probability
+    The likelihood of a single founder-to-leaf lineage; it is not part of the
+    fitting loss. With missing data the leaf is observed with probability
     ``exp(-heritable_eps * d(o, x)) * (1 - stochastic_delta)``.
 
     Args:
